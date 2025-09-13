@@ -1,0 +1,8 @@
+streamlit==1.37.1
+playwright==1.47.0
+beautifulsoup4==4.12.3
+requests==2.32.3
+pandas==2.2.2
+pypdf==4.3.1
+reportlab==4.2.2
+python-slugify==8.0.4
