@@ -1,7 +1,7 @@
-streamlit>=1.32
-beautifulsoup4>=4.12
-lxml>=5.2
-requests>=2.31
-pypdf>=4.2
-pillow>=10.3
-openai>=1.42 
+streamlit>=1.49
+beautifulsoup4
+lxml
+requests
+pypdf
+pillow
+openai
