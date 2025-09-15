@@ -1,8 +1,7 @@
-streamlit>=1.49
-beautifulsoup4
-lxml
+streamlit
 requests
+beautifulsoup4
+pandas
 pypdf
-pillow
-openai
 reportlab
+fpdf2
