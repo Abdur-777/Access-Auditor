@@ -11,6 +11,9 @@ import requests
 from bs4 import BeautifulSoup, Tag
 import streamlit as st
 
+# Must be the first Streamlit call in the script
+st.set_page_config(page_title="Accessibility Auditor — WCAG 2.2 AA", layout="wide")
+
 # =========================
 # Branding / Styling (Wyndham blue, no logo)
 # =========================
@@ -38,8 +41,6 @@ def inject_brand_css():
         unsafe_allow_html=True,
     )
 
-
-inject_brand_css()
 
 # =========================
 # Fetch helpers (browser-like headers + cache)
@@ -308,7 +309,9 @@ def export_pdf_wyndham(filepath: str, url: str, scores: Dict, contrast_checked: 
 # UI
 # =========================
 
-st.set_page_config(page_title="Accessibility Auditor — WCAG 2.2 AA", layout="wide")
+
+# Inject brand CSS after set_page_config
+inject_brand_css()
 
 st.markdown("""
 <div class="wy-accents">
@@ -390,6 +393,7 @@ if scan_html_clicked:
                 "contrast_checked": report["contrast_checked"],
                 "contrast_failed": report["contrast_failed"],
                 "alt_issues": report["alt_issues"],
+                "contrast_examples": report["contrast_examples"],
             }
             st.session_state["latest_run"] = latest_run
 
@@ -434,10 +438,8 @@ if latest_run:
                 st.write("No inline-style contrast failures found.")
             else:
                 st.write("Examples of elements that failed 1.4.3 (AA) threshold:")
-                for ex in analyze_html.cache_info():
-                    pass  # no-op to keep linter quiet
-                # Show from last analysis — recompute lightweight examples
-                # We kept examples in analysis; recompute here would duplicate work.
+                for ex in latest_run.get("contrast_examples", [])[:10]:
+                    st.write(f"• <{ex.get('tag','?')}> ratio {ex.get('ratio','?')}: {ex.get('text','')} ")
 
         with st.expander("Images missing alt text"):
             if not latest_run["alt_issues"]:
