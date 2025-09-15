@@ -18,15 +18,27 @@ from PIL import Image
 from pypdf import PdfReader
 
 # ------- Report generation (reportlab) -------
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.enums import TA_LEFT
-from reportlab.lib import utils
-from reportlab.lib.units import mm
+# ------- Report generation (reportlab) -------
+# Use ReportLab if available; otherwise fall back to fpdf2 (lighter, pure-Python)
+HAVE_REPORTLAB = False
+HAVE_FPDF = False
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib import utils
+    from reportlab.lib.units import mm
+    HAVE_REPORTLAB = True
+except Exception:
+    try:
+        from fpdf import FPDF
+        HAVE_FPDF = True
+    except Exception:
+        pass
 
 # ==========================
 # Wyndham presets & branding
@@ -341,82 +353,130 @@ def suggest_fix_for_img_alt(img_issue: Dict) -> str:
 # =====================
 
 def build_pdf_report(path: str, brand: Dict, target_url: str, html_result: Optional[Dict], pdf_results: List[PdfAccessibility]):
-    doc = SimpleDocTemplate(path, pagesize=A4, leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
-    styles = getSampleStyleSheet()
-    styles["Normal"].fontName = "Helvetica"
-    styles["Heading1"].alignment = TA_LEFT
-    story = []
+    if HAVE_REPORTLAB:
+        doc = SimpleDocTemplate(path, pagesize=A4, leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
+        styles = getSampleStyleSheet()
+        styles["Normal"].fontName = "Helvetica"
+        styles["Heading1"].alignment = TA_LEFT
+        story = []
 
-    # Header with logo
-    try:
-        logo_img = ImageReader(requests.get(brand["logo"], timeout=10).content)
-        story.append(utils.Image(logo_img, width=120, height=30))
-    except Exception:
-        story.append(Paragraph(f"<b>{brand['name']}</b>", styles["Heading1"]))
+        # Header with logo
+        try:
+            logo_img = ImageReader(requests.get(brand["logo"], timeout=10).content)
+            story.append(utils.Image(logo_img, width=120, height=30))
+        except Exception:
+            story.append(Paragraph(f"<b>{brand['name']}</b>", styles["Heading1"]))
 
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("<b>Accessibility Audit Report</b>", styles["Heading1"]))
-    story.append(Spacer(1, 6))
-    story.append(Paragraph(f"Target URL: {target_url}", styles["Normal"]))
-    story.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
-    story.append(Spacer(1, 12))
-
-    if html_result:
-        story.append(Paragraph("<b>WCAG 1.4.3 Color Contrast (HTML)</b>", styles["Heading2"]))
-        summary = [["Checked elements", html_result["checked"]],
-                   ["Passed", html_result["pass_count"]],
-                   ["Score (%)", html_result["score"]]]
-        t = Table(summary, colWidths=[140, 340])
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.HexColor(brand["primary"])),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-            ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
-            ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
-        ]))
-        story.append(t)
         story.append(Spacer(1, 8))
+        story.append(Paragraph("<b>Accessibility Audit Report</b>", styles["Heading1"]))
+        story.append(Spacer(1, 6))
+        story.append(Paragraph(f"Target URL: {target_url}", styles["Normal"]))
+        story.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
+        story.append(Spacer(1, 12))
 
-        if html_result["contrast_issues"]:
-            story.append(Paragraph("<b>Contrast Issues (examples)</b>", styles["Heading3"]))
-            rows = [["Tag", "Text (truncated)", "FG", "BG", "Ratio"]]
-            for i in html_result["contrast_issues"][:12]:
-                rows.append([i["tag"], i["text"][:60], i["fg"], i["bg"], i["ratio"]])
-            tt = Table(rows, colWidths=[50, 250, 60, 60, 60])
-            tt.setStyle(TableStyle([
+        if html_result:
+            story.append(Paragraph("<b>WCAG 1.4.3 Color Contrast (HTML)</b>", styles["Heading2"]))
+            summary = [["Checked elements", html_result["checked"]],
+                       ["Passed", html_result["pass_count"]],
+                       ["Score (%)", html_result["score"]]]
+            t = Table(summary, colWidths=[140, 340])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor(brand["primary"])),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
                 ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
                 ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
             ]))
-            story.append(tt)
+            story.append(t)
             story.append(Spacer(1, 8))
 
-        if html_result["img_alt_issues"]:
-            story.append(Paragraph("<b>Images Missing Alt Text (examples)</b>", styles["Heading3"]))
-            rows = [["Image src"]]
-            for i in html_result["img_alt_issues"][:12]:
-                rows.append([i["src"]])
-            tt = Table(rows, colWidths=[480])
-            tt.setStyle(TableStyle([
+            if html_result["contrast_issues"]:
+                story.append(Paragraph("<b>Contrast Issues (examples)</b>", styles["Heading3"]))
+                rows = [["Tag", "Text (truncated)", "FG", "BG", "Ratio"]]
+                for i in html_result["contrast_issues"][:12]:
+                    rows.append([i["tag"], i["text"][:60], i["fg"], i["bg"], i["ratio"]])
+                tt = Table(rows, colWidths=[50, 250, 60, 60, 60])
+                tt.setStyle(TableStyle([
+                    ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
+                    ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
+                ]))
+                story.append(tt)
+                story.append(Spacer(1, 8))
+
+            if html_result["img_alt_issues"]:
+                story.append(Paragraph("<b>Images Missing Alt Text (examples)</b>", styles["Heading3"]))
+                rows = [["Image src"]]
+                for i in html_result["img_alt_issues"][:12]:
+                    rows.append([i["src"]])
+                tt = Table(rows, colWidths=[480])
+                tt.setStyle(TableStyle([
+                    ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
+                    ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
+                ]))
+                story.append(tt)
+                story.append(Spacer(1, 12))
+
+        if pdf_results:
+            story.append(Paragraph("<b>PDF Accessibility (WCAG-related)</b>", styles["Heading2"]))
+            rows = [["PDF URL", "Pages", "Tagged?", "Images", "Alt texts (heuristic)", "Notes"]]
+            for r in pdf_results[:10]:
+                rows.append([r.url, r.pages, "Yes" if r.is_tagged else "No", r.image_count, r.alt_text_count, r.notes])
+            t = Table(rows, colWidths=[180, 40, 50, 50, 70, 120])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor(brand["primary"])),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
                 ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
                 ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
             ]))
-            story.append(tt)
-            story.append(Spacer(1, 12))
+            story.append(t)
 
-    if pdf_results:
-        story.append(Paragraph("<b>PDF Accessibility (WCAG-related)</b>", styles["Heading2"]))
-        rows = [["PDF URL", "Pages", "Tagged?", "Images", "Alt texts (heuristic)", "Notes"]]
-        for r in pdf_results[:10]:
-            rows.append([r.url, r.pages, "Yes" if r.is_tagged else "No", r.image_count, r.alt_text_count, r.notes])
-        t = Table(rows, colWidths=[180, 40, 50, 50, 70, 120])
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), colors.HexColor(brand["primary"])),
-            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-            ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
-            ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
-        ]))
-        story.append(t)
+        doc.build(story)
+        return
 
-    doc.build(story)
+    if HAVE_FPDF:
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0, 10, txt=f"{brand['name']} — Accessibility Audit", ln=True)
+        pdf.set_font("Arial", size=12)
+        pdf.cell(0, 8, txt=f"Target URL: {target_url}", ln=True)
+        pdf.cell(0, 8, txt=f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True)
+        pdf.ln(4)
+
+        if html_result:
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, txt="WCAG 1.4.3 Color Contrast (HTML)", ln=True)
+            pdf.set_font("Arial", size=12)
+            pdf.cell(0, 8, txt=f"Checked: {html_result['checked']}  |  Passed: {html_result['pass_count']}  |  Score: {html_result['score']}%", ln=True)
+            pdf.ln(2)
+            if html_result["contrast_issues"]:
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(0, 8, txt="Contrast Issues (examples)", ln=True)
+                pdf.set_font("Arial", size=11)
+                for i in html_result["contrast_issues"][:10]:
+                    pdf.multi_cell(0, 6, txt=f"- <{i['tag']}> '{i['text'][:60]}' FG {i['fg']} BG {i['bg']} Ratio {i['ratio']}")
+                pdf.ln(2)
+            if html_result["img_alt_issues"]:
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(0, 8, txt="Images Missing Alt Text (examples)", ln=True)
+                pdf.set_font("Arial", size=11)
+                for i in html_result["img_alt_issues"][:10]:
+                    pdf.multi_cell(0, 6, txt=f"- {i['src']}")
+                pdf.ln(2)
+
+        if pdf_results:
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, txt="PDF Accessibility (WCAG-related)", ln=True)
+            pdf.set_font("Arial", size=11)
+            for r in pdf_results[:10]:
+                pdf.multi_cell(0, 6, txt=f"- {r.url} — pages={r.pages} tagged={'Yes' if r.is_tagged else 'No'} images={r.image_count} alt_est={r.alt_text_count} notes={r.notes}")
+                pdf.ln(1)
+
+        pdf.output(path)
+        return
+
+    # If neither library is available, raise a helpful error.
+    raise RuntimeError("No PDF library available. Install 'reportlab' or 'fpdf2' (preferred fallback) in requirements.txt.")
 
 
 # =====================
@@ -573,19 +633,22 @@ with col1:
 
 with col2:
     st.subheader("2) Export Report")
-    if st.button("Generate PDF Report (Wyndham-branded)"):
-        html_result = st.session_state.get("html_result")
-        pdf_results = st.session_state.get("pdf_results", [])
-        if not (html_result or pdf_results):
-            st.warning("Run a scan first.")
-        else:
-            out_path = os.path.join(DATA_DIR, f"audit_{int(time.time())}.pdf")
-            try:
-                build_pdf_report(out_path, WYNDHAM, target_url or "(none)", html_result, pdf_results)
-                with open(out_path, "rb") as f:
-                    st.download_button("Download Report PDF", data=f.read(), file_name=os.path.basename(out_path), mime="application/pdf")
-            except Exception as e:
-                st.error(f"Report failed: {e}")
+    if HAVE_REPORTLAB or HAVE_FPDF:
+        if st.button("Generate PDF Report (Wyndham-branded)"):
+            html_result = st.session_state.get("html_result")
+            pdf_results = st.session_state.get("pdf_results", [])
+            if not (html_result or pdf_results):
+                st.warning("Run a scan first.")
+            else:
+                out_path = os.path.join(DATA_DIR, f"audit_{int(time.time())}.pdf")
+                try:
+                    build_pdf_report(out_path, WYNDHAM, target_url or "(none)", html_result, pdf_results)
+                    with open(out_path, "rb") as f:
+                        st.download_button("Download Report PDF", data=f.read(), file_name=os.path.basename(out_path), mime="application/pdf")
+                except Exception as e:
+                    st.error(f"Report failed: {e}")
+    else:
+        st.info("PDF export requires either **reportlab** or **fpdf2**. Add one to requirements.txt and redeploy.")
 
 st.markdown("---")
 
