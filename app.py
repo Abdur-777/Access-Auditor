@@ -4,7 +4,7 @@
 
 import re, time, math
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from typing import List, Dict, Tuple, Optional
 
 import requests
@@ -145,6 +145,16 @@ def suggest_alt(src: str, width: Optional[int] = None, height: Optional[int] = N
     human = (human[:77] + "…") if len(human) > 80 else human
     return (human or "Image", "descriptive")
 
+# Normalize image URL for dedupe (drop query/fragment)
+def normalize_src(src: str) -> str:
+    try:
+        u = urlparse(src)
+        if u.scheme and u.netloc:
+            return f"{u.scheme}://{u.netloc}{u.path}"
+        return u.path or src
+    except Exception:
+        return src
+
 
 # =========================
 # Analysis: find inline styles and image alts
@@ -189,9 +199,10 @@ def analyze_html(html: str, assume_bg: Tuple[int, int, int] = (255, 255, 255), s
         src = img.get("src") or ""
         if not src:
             continue
-        if src in seen_src:
+        norm = normalize_src(src)
+        if norm in seen_src:
             continue
-        seen_src.add(src)
+        seen_src.add(norm)
         current_alt = (img.get("alt") or "").strip()
         w = int(img.get("width") or 0) or None
         h = int(img.get("height") or 0) or None
@@ -340,6 +351,10 @@ with st.sidebar:
         pasted_html = st.text_area("Raw HTML", height=160, placeholder="Paste a full HTML document here…")
         use_pasted = st.checkbox("Use pasted HTML for this scan", value=False)
 
+    st.markdown("---")
+    auto_save = st.checkbox("Auto-save after scan", value=st.session_state.get("auto_save", True), help="Automatically save successful scans to the Dashboard.")
+    st.session_state["auto_save"] = auto_save
+
 # Session history store
 if "history" not in st.session_state:
     st.session_state["history"] = []  # each item: dict with timestamp, url, scores, counts
@@ -349,7 +364,7 @@ st.subheader("Run Audit")
 col1, col2, col3 = st.columns([1, 1, 1])
 
 scan_html_clicked = col1.button("\U0001F50D Scan HTML (Contrast & Alts)")
-scan_pdfs_clicked = col2.button("\U0001F4C1 Scan PDFs (Tagging & Alts)")
+scan_pdfs_clicked = col2.button("📁 Scan PDFs (Tagging & Alts)", disabled=True, help="Coming soon — HTML quick-check is live.")
 export_pdf_clicked = col3.button("\U0001F4BE Generate PDF (Wyndham‑branded)")
 
 st.markdown("---")
@@ -396,6 +411,20 @@ if scan_html_clicked:
                 "contrast_examples": report["contrast_examples"],
             }
             st.session_state["latest_run"] = latest_run
+            # Auto-save if enabled
+            if st.session_state.get("auto_save", False):
+                st.session_state["history"].append(
+                    {
+                        "timestamp": latest_run["timestamp"],
+                        "url": latest_run["url"],
+                        "contrast_score": latest_run["scores"]["contrast_score"],
+                        "overall_score": latest_run["scores"]["overall_score"],
+                        "contrast_checked": latest_run["contrast_checked"],
+                        "contrast_failed": latest_run["contrast_failed"],
+                        "alt_issues": len(latest_run["alt_issues"]),
+                    }
+                )
+                st.success("Saved automatically to Dashboard.")
 
 # ======== PDF scan (placeholder) ========
 if scan_pdfs_clicked:
@@ -431,6 +460,16 @@ if latest_run:
         m1.metric("Contrast Score (%)", latest_run["scores"]["contrast_score"])
         m2.metric("Overall Score", latest_run["scores"]["overall_score"])
         m3.metric("Alt issues", len(latest_run["alt_issues"]))
+
+        # Quick downloads
+        if latest_run["alt_issues"]:
+            try:
+                import pandas as pd
+                alt_df = pd.DataFrame(latest_run["alt_issues"])  # src, suggested_alt, classification
+                csv_bytes = alt_df.to_csv(index=False).encode("utf-8")
+                st.download_button("Download CSV (Alt issues)", data=csv_bytes, file_name="alt_issues.csv", mime="text/csv")
+            except Exception:
+                pass
 
         # Expanders
         with st.expander("Contrast fails (examples)"):
