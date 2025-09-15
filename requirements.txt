@@ -1,11 +1,7 @@
-# --- Core app ---
-streamlit==1.32.0
-requests==2.32.3
-beautifulsoup4==4.12.3
-pandas==2.2.2
-
-# --- PDF export ---
-reportlab==4.2.2
-
-# --- Recommended (images & fast parsing) ---
-Pillow==10.4.0
+streamlit>=1.33
+requests>=2.31
+beautifulsoup4>=4.12
+pandas>=2.0
+reportlab>=4.0
+# Optional for computed-style contrast (headless):
+playwright>=1.46
