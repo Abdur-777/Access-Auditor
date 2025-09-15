@@ -18,14 +18,14 @@
 #   - Checks: images alt, doc language, headings outline, links/buttons names,
 #     form labels, duplicate IDs, page title, meta viewport, color contrast
 #     (inline style approximate), ARIA misuse, PDFs text extraction presence
-#   - Capped crawl (same-origin) depth 0–1 (optional)
+#   - NEW: Restrict crawl to a path prefix (e.g., /services)
+#   - Hardened fetch headers (browser-like)
 #   - Download CSV/JSON reports
 #   - Generate prioritized Remediation Plan (optional, OpenAI)
 #
 # Notes:
 #   - Color-contrast check uses inline styles only (approximate; no external CSS parsing).
-#   - This is a pragmatic starter. For production, consider integrating axe-core/pa11y via API
-#     or headless browser for full CSS/JS rendering.
+#   - For production-grade JS/CSS rendering, pair with axe-core/pa11y via a headless browser.
 
 import os
 import re
@@ -82,14 +82,45 @@ def is_same_origin(base: str, url: str) -> bool:
         return False
 
 
-def fetch_url(url: str, timeout: int = 25) -> Optional[str]:
+def allow_url(base: str, candidate: str, prefix: str = "") -> bool:
+    """
+    Same origin AND (if provided) candidate.path starts with prefix (e.g., '/services').
+    """
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "AccessibilityAuditor/1.0"})
+        b, c = urlparse(base), urlparse(candidate)
+        if (b.scheme, b.netloc) != (c.scheme, c.netloc):
+            return False
+        if prefix:
+            pref = prefix if prefix.startswith("/") else f"/{prefix}"
+            return c.path.startswith(pref)
+        return True
+    except Exception:
+        return False
+
+
+def fetch_url(url: str, timeout: int = 30) -> Optional[str]:
+    """
+    Fetch text content with hardened, browser-like headers.
+    Returns HTML/text or None on failure.
+    """
+    try:
+        r = requests.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-AU,en;q=0.9",
+                "Cache-Control": "no-cache",
+            },
+        )
         r.raise_for_status()
         ct = r.headers.get("Content-Type", "").lower()
         if "text/html" in ct or url.lower().endswith((".html", ".htm")):
             return r.text
-        # Attempt text for other text-like content
         if "text/" in ct:
             return r.text
         return None
@@ -120,19 +151,16 @@ def parse_color(style_val: str) -> Optional[Tuple[int, int, int]]:
     if not HAS_PIL:
         return None
     try:
-        # Extract color tokens like 'color:#112233' or 'background:#fafafa'
         m = re.search(r"(?:color|background(?:-color)?)\s*:\s*([^;]+)", style_val, re.I)
         if not m:
             return None
         raw = m.group(1).strip()
-        # PIL handles #hex, rgb(), named colors
         return ImageColor.getrgb(raw)
     except Exception:
         return None
 
 
 def rel_luminance(rgb: Tuple[int, int, int]) -> float:
-    # WCAG relative luminance
     def adj(c: float) -> float:
         c = c / 255.0
         return c / 12.92 if c <= 0.03928 else ((c + 0.055)/1.055) ** 2.4
@@ -148,8 +176,6 @@ def contrast_ratio(fg: Tuple[int, int, int], bg: Tuple[int, int, int]) -> float:
 
 
 def wcag_ref(code: str) -> str:
-    # Minimal mapping helper for quick linking
-    # (Not printing full URLs to keep UI clean; you can add links if you want.)
     refs = {
         "1.1.1": "Non-text Content",
         "1.3.1": "Info and Relationships",
@@ -178,7 +204,7 @@ def add_issue(issues: List[Dict[str, Any]], severity: str, code: str, msg: str, 
         "wcag_title": wcag_ref(code),
         "message": msg,
         "count": len(nodes),
-        "examples": nodes[:5],  # cap examples
+        "examples": nodes[:5],
     })
 
 
@@ -212,17 +238,12 @@ def audit_html(html: str, base_url: Optional[str] = None) -> List[Dict[str, Any]
     for img in imgs:
         alt = (img.get("alt") or "").strip()
         role = (img.get("role") or "").strip().lower()
-        # Pure decorative images should be alt="", but content images need meaningful alt
         if role == "presentation":
             continue
         if alt == "" or len(alt) <= 1:
             bad_imgs.append(str(img)[:180])
     if bad_imgs:
-        add_issue(
-            issues, "high", "1.1.1",
-            "Images missing meaningful alt text.",
-            bad_imgs
-        )
+        add_issue(issues, "high", "1.1.1", "Images missing meaningful alt text.", bad_imgs)
 
     # 4) Headings outline & single H1 (1.3.1, 2.4.6)
     headings = [(h.name, h.get_text(" ", strip=True)) for h in soup.find_all(re.compile("^h[1-6]$"))]
@@ -233,18 +254,13 @@ def audit_html(html: str, base_url: Optional[str] = None) -> List[Dict[str, Any]
             "No <h1> found. Provide a clear page heading.",
             [f"{h}:{t[:80]}" for h, t in headings[:5]] or ["No headings present"]
         )
-    # Check order roughly non-skipping e.g., h2 should not follow h4
     level_seq = [int(h[1]) for h, _ in headings]
     bad_seq = []
     for i in range(1, len(level_seq)):
         if level_seq[i] > level_seq[i-1] + 1:
             bad_seq.append(f"{headings[i-1][0]} → {headings[i][0]} ({headings[i][1][:60]})")
     if bad_seq:
-        add_issue(
-            issues, "low", "1.3.1",
-            "Heading levels skip order (e.g., h2 → h4).",
-            bad_seq
-        )
+        add_issue(issues, "low", "1.3.1", "Heading levels skip order (e.g., h2 → h4).", bad_seq)
 
     # 5) Links & buttons accessible name (2.4.4, 4.1.2)
     bad_links = []
@@ -255,11 +271,7 @@ def audit_html(html: str, base_url: Optional[str] = None) -> List[Dict[str, Any]
         if not name or name.lower() in {"", "click here", "here", "more", "read more"}:
             bad_links.append(f"<a href='{href}'> {name or '[empty]'} </a>")
     if bad_links:
-        add_issue(
-            issues, "medium", "2.4.4",
-            "Links must have a clear accessible name/purpose.",
-            bad_links
-        )
+        add_issue(issues, "medium", "2.4.4", "Links must have a clear accessible name/purpose.", bad_links)
 
     bad_buttons = []
     for b in soup.find_all(["button", "input"]):
@@ -276,11 +288,7 @@ def audit_html(html: str, base_url: Optional[str] = None) -> List[Dict[str, Any]
             if not name:
                 bad_buttons.append(str(b)[:160])
     if bad_buttons:
-        add_issue(
-            issues, "medium", "4.1.2",
-            "Buttons need an accessible name (text, aria-label, or title).",
-            bad_buttons
-        )
+        add_issue(issues, "medium", "4.1.2", "Buttons need an accessible name (text, aria-label, or title).", bad_buttons)
 
     # 6) Form labels (3.3.2)
     inputs = soup.find_all("input")
@@ -298,17 +306,12 @@ def audit_html(html: str, base_url: Optional[str] = None) -> List[Dict[str, Any]
         if _id and _id in label_map:
             has_label = True
         if not has_label:
-            # aria-label or aria-labelledby acceptable
             if inp.get("aria-label") or inp.get("aria-labelledby") or inp.get("title"):
                 has_label = True
         if not has_label:
             unlabeled.append(str(inp)[:160])
     if unlabeled:
-        add_issue(
-            issues, "high", "3.3.2",
-            "Inputs missing labels or accessible names.",
-            unlabeled
-        )
+        add_issue(issues, "high", "3.3.2", "Inputs missing labels or accessible names.", unlabeled)
 
     # 7) Duplicate IDs (4.1.1)
     ids: Dict[str, int] = {}
@@ -321,35 +324,25 @@ def audit_html(html: str, base_url: Optional[str] = None) -> List[Dict[str, Any]
         if v > 1:
             dups.append(f"id='{k}' appears {v} times")
     if dups:
-        add_issue(
-            issues, "low", "4.1.1",
-            "Duplicate element IDs found.",
-            dups
-        )
+        add_issue(issues, "low", "4.1.1", "Duplicate element IDs found.", dups)
 
     # 8) Meta viewport (1.4.10 Reflow – partial heuristic)
     vp = soup.find("meta", attrs={"name": "viewport"})
     if not vp:
-        add_issue(
-            issues, "low", "1.4.10",
-            "Missing <meta name='viewport'> may hinder reflow on mobile.",
-            ["<meta name='viewport' ...> not found"]
-        )
+        add_issue(issues, "low", "1.4.10", "Missing <meta name='viewport'> may hinder reflow on mobile.", ["<meta name='viewport' ...> not found"])
 
-    # 9) Inline contrast (1.4.3) — heuristic only
+    # 9) Inline contrast (1.4.3) — heuristic
     low_contrast: List[str] = []
-    # Check common text nodes containers with inline style specifying color/background
     for el in soup.find_all(True):
         style = el.get("style", "")
         if not style:
             continue
         fg = parse_color(style)
         bg = None
-        # Try to parse background-color from same style, otherwise assume white
         try:
             m = re.search(r"background(?:-color)?\s*:\s*([^;]+)", style, re.I)
             if m and HAS_PIL:
-                from PIL import ImageColor as _IC  # local import ok
+                from PIL import ImageColor as _IC
                 bg = _IC.getrgb(m.group(1).strip())
         except Exception:
             bg = None
@@ -358,18 +351,13 @@ def audit_html(html: str, base_url: Optional[str] = None) -> List[Dict[str, Any]
                 bg = (255, 255, 255)
             try:
                 cr = contrast_ratio(fg, bg)
-                # AA threshold: 4.5 for normal text (we can't detect font-size reliably here)
                 if cr < 4.5:
                     txt = el.get_text(" ", strip=True)[:80]
                     low_contrast.append(f"contrast≈{cr:.2f} | '{txt}' | style='{style[:80]}'")
             except Exception:
                 pass
     if low_contrast:
-        add_issue(
-            issues, "high", "1.4.3",
-            "Possible insufficient color contrast (inline styles).",
-            low_contrast
-        )
+        add_issue(issues, "high", "1.4.3", "Possible insufficient color contrast (inline styles).", low_contrast)
 
     # 10) Basic ARIA misuse scan (4.1.2)
     bad_aria: List[str] = []
@@ -377,23 +365,17 @@ def audit_html(html: str, base_url: Optional[str] = None) -> List[Dict[str, Any]
         role = el.get("role")
         aria_hidden = el.get("aria-hidden")
         if aria_hidden == "true":
-            # if focusable child (cannot detect reliably), warn if interactive tag used
             if el.name in {"a", "button", "input", "textarea", "select"}:
                 bad_aria.append(f"{el.name} has aria-hidden='true' but is interactive")
         if role == "presentation" and el.name in {"a", "button", "input"}:
             bad_aria.append(f"{el.name} should not use role='presentation'")
     if bad_aria:
-        add_issue(
-            issues, "low", "4.1.2",
-            "Potential ARIA misuse.",
-            bad_aria
-        )
+        add_issue(issues, "low", "4.1.2", "Potential ARIA misuse.", bad_aria)
 
     return issues
 
 
 def audit_pdf(text: str) -> List[Dict[str, Any]]:
-    """Very light PDF heuristic: check if any extractable text exists."""
     issues: List[Dict[str, Any]] = []
     if not text or text.strip() == "":
         add_issue(
@@ -404,8 +386,11 @@ def audit_pdf(text: str) -> List[Dict[str, Any]]:
     return issues
 
 
-def crawl_and_collect(url: str, depth: int = 0, max_pages: int = 5) -> List[Tuple[str, Optional[str]]]:
-    """Return list of (url, html_text) for same-origin pages up to depth."""
+def crawl_and_collect(url: str, depth: int = 0, max_pages: int = 5, path_prefix: str = "") -> List[Tuple[str, Optional[str]]]:
+    """
+    Return list of (url, html_text) for same-origin pages up to depth,
+    restricted to optional path_prefix (e.g., '/services').
+    """
     seen: Set[str] = set()
     out: List[Tuple[str, Optional[str]]] = []
     base = url
@@ -422,11 +407,11 @@ def crawl_and_collect(url: str, depth: int = 0, max_pages: int = 5) -> List[Tupl
                 soup = BeautifulSoup(html, "lxml")
                 for a in soup.find_all("a", href=True):
                     nxt = urljoin(u, a["href"])
-                    if nxt.startswith("mailto:") or nxt.startswith("tel:"):
+                    if nxt.startswith(("mailto:", "tel:", "javascript:")):
                         continue
-                    if is_same_origin(base, nxt):
-                        q.append((nxt, d+1))
-                        if len(q) > max_pages * 2:  # keep queue bounded
+                    if allow_url(base, nxt, prefix=path_prefix):
+                        q.append((nxt, d + 1))
+                        if len(q) > max_pages * 2:
                             q = q[:max_pages * 2]
             except Exception:
                 pass
@@ -491,11 +476,21 @@ with st.sidebar:
     base_url = ""
     uploaded_html = None
     uploaded_pdf = None
+    path_prefix = ""
 
     if mode == "URL":
         base_url = st.text_input("URL to audit", placeholder="https://www.example.com")
+        path_prefix = st.text_input("Restrict to path (optional)", value="", help="e.g., /services")
         crawl_depth = st.slider("Crawl depth (same origin)", 0, 1, 0, help="Depth 0 = single page; Depth 1 ≈ follow internal links.")
         max_pages = st.slider("Max pages", 1, 20, 5)
+
+        # Convenience: 1-click Wyndham demo
+        if st.button("Demo Audit (Wyndham /services)"):
+            base_url = "https://www.wyndham.vic.gov.au/services"
+            path_prefix = "/services"
+            st.session_state["__demo_params"] = dict(url=base_url, prefix=path_prefix, depth=1, max_pages=8)
+            st.experimental_rerun()
+
     elif mode == "Upload HTML":
         uploaded_html = st.file_uploader("Upload .html", type=["html", "htm"])
     else:
@@ -514,18 +509,28 @@ with col_report:
     issues_all: List[Dict[str, Any]] = []
     pages_audited: List[str] = []
 
+    # Handle demo params if present
+    demo_params = st.session_state.pop("__demo_params", None)
+
     if mode == "URL":
-        if st.button("Run Audit", type="primary", use_container_width=True):
+        run_clicked = st.button("Run Audit", type="primary", use_container_width=True)
+        if demo_params:
+            base_url = demo_params["url"]
+            path_prefix = demo_params["prefix"]
+            crawl_depth = demo_params["depth"]
+            max_pages = demo_params["max_pages"]
+            run_clicked = True  # force run with demo params
+
+        if run_clicked:
             if not base_url.strip():
                 st.warning("Please enter a URL.")
             else:
-                with st.spinner("Fetching and analyzing..."):
-                    pages = crawl_and_collect(base_url.strip(), depth=crawl_depth, max_pages=max_pages)
+                with st.spinner(f"Fetching and analyzing (depth={crawl_depth}, max_pages={max_pages}, prefix='{path_prefix or '/'}')..."):
+                    pages = crawl_and_collect(base_url.strip(), depth=crawl_depth, max_pages=max_pages, path_prefix=path_prefix.strip())
                     for u, html in pages:
                         pages_audited.append(u)
                         if html:
                             issues = audit_html(html, base_url=u)
-                            # Annotate each issue with page
                             for it in issues:
                                 it["page"] = u
                             issues_all.extend(issues)
@@ -539,6 +544,7 @@ with col_report:
                                 "examples": [u],
                                 "page": u,
                             })
+
     elif mode == "Upload HTML":
         if st.button("Run Audit", type="primary", use_container_width=True):
             if not uploaded_html:
@@ -550,6 +556,7 @@ with col_report:
                     issues_all = audit_html(html_text)
                     for it in issues_all:
                         it["page"] = uploaded_html.name
+
     else:
         if st.button("Run Audit", type="primary", use_container_width=True):
             if not uploaded_pdf:
@@ -584,7 +591,6 @@ with col_report:
                 st.write(f"**Count:** {it['count']}")
                 if it.get("examples"):
                     st.code("\n\n".join(it["examples"]), language="html")
-                # Quick remediation hints
                 st.markdown("**Remediation tips:**")
                 hints = remediation_hints(it["wcag"])
                 if hints:
@@ -596,7 +602,6 @@ with col_report:
         st.subheader("Export")
         as_json = json.dumps(issues_all, ensure_ascii=False, indent=2)
         st.download_button("Download JSON", as_json, file_name="accessibility_report.json", mime="application/json")
-        # CSV (flat rows)
         import csv
         from io import StringIO
         csv_buf = StringIO()
@@ -611,7 +616,7 @@ with col_report:
         st.divider()
 
         if want_plan:
-            target = base_url or (uploaded_html.name if uploaded_html else uploaded_pdf.name if uploaded_pdf else "Uploaded file")
+            target = (base_url or (uploaded_html.name if uploaded_html else uploaded_pdf.name if uploaded_pdf else "Uploaded file"))
             st.subheader("Remediation Plan")
             with st.spinner("Drafting plan..."):
                 plan = remediation_plan(issues_all, target)
