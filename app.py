@@ -1,681 +1,428 @@
-# app.py — AI Accessibility Auditor & Remediation (WCAG 2.2 AA)
-# -------------------------------------------------------------
-# Quick start:
-#   requirements.txt (suggested)
-#     streamlit>=1.32
-#     beautifulsoup4>=4.12
-#     lxml>=5.2
-#     requests>=2.31
-#     pypdf>=4.2
-#     pillow>=10.3
-#     openai>=1.42  # optional (for remediation plan)
-#
-# Run:
-#   streamlit run app.py
-#
-# Features:
-#   - Audit a URL or uploaded HTML/PDF for common WCAG 2.2 AA issues
-#   - Checks: images alt, doc language, headings outline, links/buttons names,
-#     form labels, duplicate IDs, page title, meta viewport, color contrast
-#     (inline style approximate), ARIA misuse, PDFs text extraction presence
-#   - NEW: Restrict crawl to a path prefix (e.g., /services)
-#   - Hardened fetch headers (browser-like)
-#   - Download CSV/JSON reports
-#   - Generate prioritized Remediation Plan (optional, OpenAI)
-#
-# Notes:
-#   - Color-contrast check uses inline styles only (approximate; no external CSS parsing).
-#   - For production-grade JS/CSS rendering, pair with axe-core/pa11y via a headless browser.
+# Accessibility Auditor (WCAG quick-check) — Streamlit app
+# --------------------------------------------------------
+# Features
+# - Input a URL, paste HTML, or upload an .html file
+# - Lightweight heuristics to flag common issues (img alt, link text, label/inputs, headings order, lang attr)
+# - WCAG code mapping → remediation hints (robust to missing/variant codes)
+# - Safe guards: no KeyError on missing keys, tolerant parsing
+# - Results table + per-issue expanders + CSV/JSON downloads
+# - Single-file app.py for Render/Streamlit Cloud
 
-import os
 import re
 import io
 import json
-import time
-import traceback
-from urllib.parse import urljoin, urlparse
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Dict, Any, Iterable
 
 import requests
-import streamlit as st
 from bs4 import BeautifulSoup
-from typing import List, Dict, Any, Optional, Tuple, Set
 
-# Optional OpenAI (for remediation plan)
-try:
-    from openai import OpenAI
-    HAS_OPENAI = True
-except Exception:
-    HAS_OPENAI = False
+import streamlit as st
 
-# Optional PDF text extraction
-try:
-    from pypdf import PdfReader
-    HAS_PYPDF = True
-except Exception:
-    HAS_PYPDF = False
+# -----------------------------
+# WCAG mapping & helpers
+# -----------------------------
+WCAG_HINTS: Dict[str, str] = {
+    "1.1.1": "Provide text alternatives for non-text content.",
+    "1.3.1": "Use semantic HTML and landmarks to convey structure.",
+    "1.4.3": "Ensure sufficient color contrast (AA).",
+    "2.1.1": "All functionality must be keyboard accessible.",
+    "2.4.4": "Use meaningful link text that describes the destination.",
+    "2.4.6": "Use descriptive headings and labels.",
+    "3.1.1": "Specify the default language of the page (e.g., <html lang='en'>).",
+    "3.3.2": "Associate labels with form inputs and provide instructions.",
+}
 
-# Optional for color parsing
-try:
-    from PIL import ImageColor
-    HAS_PIL = True
-except Exception:
-    HAS_PIL = False
+WCAG_CODE_REGEX = re.compile(r"(\d\.\d\.\d)")
 
-
-# ---------------------------- Config ----------------------------
-
-st.set_page_config(page_title="AI Accessibility Auditor", page_icon="♿", layout="wide")
-
-APP_NAME = "AI Accessibility Auditor"
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-
-# ---------------------------- Helpers ---------------------------
-
-def is_same_origin(base: str, url: str) -> bool:
-    try:
-        pb = urlparse(base)
-        pu = urlparse(url)
-        return (pu.scheme, pu.netloc) == (pb.scheme, pb.netloc)
-    except Exception:
-        return False
-
-
-def allow_url(base: str, candidate: str, prefix: str = "") -> bool:
-    """
-    Same origin AND (if provided) candidate.path starts with prefix (e.g., '/services').
-    """
-    try:
-        b, c = urlparse(base), urlparse(candidate)
-        if (b.scheme, b.netloc) != (c.scheme, c.netloc):
-            return False
-        if prefix:
-            pref = prefix if prefix.startswith("/") else f"/{prefix}"
-            return c.path.startswith(pref)
-        return True
-    except Exception:
-        return False
-
-
-def fetch_url(url: str, timeout: int = 30) -> Optional[str]:
-    """
-    Fetch text content with hardened, browser-like headers.
-    Returns HTML/text or None on failure.
-    """
-    try:
-        r = requests.get(
-            url,
-            timeout=timeout,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-AU,en;q=0.9",
-                "Cache-Control": "no-cache",
-            },
-        )
-        r.raise_for_status()
-        ct = r.headers.get("Content-Type", "").lower()
-        if "text/html" in ct or url.lower().endswith((".html", ".htm")):
-            return r.text
-        if "text/" in ct:
-            return r.text
-        return None
-    except Exception as e:
-        st.warning(f"Fetch failed for {url}: {e}")
-        return None
-
-
-def read_pdf_bytes(file) -> str:
-    if not HAS_PYPDF:
-        return "[PDF text analysis unavailable: install pypdf]"
-    try:
-        reader = PdfReader(file)
-        chunks = []
-        for i, pg in enumerate(reader.pages):
-            try:
-                txt = pg.extract_text() or ""
-            except Exception:
-                txt = ""
-            chunks.append(txt)
-        return "\n\n".join(chunks).strip()
-    except Exception as e:
-        return f"[Failed to read PDF: {e}]"
-
-
-def parse_color(style_val: str) -> Optional[Tuple[int, int, int]]:
-    """Parse a CSS color from inline styles using PIL.ImageColor if present."""
-    if not HAS_PIL:
-        return None
-    try:
-        m = re.search(r"(?:color|background(?:-color)?)\s*:\s*([^;]+)", style_val, re.I)
-        if not m:
-            return None
-        raw = m.group(1).strip()
-        return ImageColor.getrgb(raw)
-    except Exception:
-        return None
-
-
-def rel_luminance(rgb: Tuple[int, int, int]) -> float:
-    def adj(c: float) -> float:
-        c = c / 255.0
-        return c / 12.92 if c <= 0.03928 else ((c + 0.055)/1.055) ** 2.4
-    r, g, b = rgb
-    return 0.2126*adj(r) + 0.7152*adj(g) + 0.0722*adj(b)
-
-
-def contrast_ratio(fg: Tuple[int, int, int], bg: Tuple[int, int, int]) -> float:
-    L1 = rel_luminance(fg)
-    L2 = rel_luminance(bg)
-    lighter, darker = (L1, L2) if L1 >= L2 else (L2, L1)
-    return (lighter + 0.05) / (darker + 0.05)
-
-
-def wcag_ref(code: str) -> str:
-    refs = {
-        "1.1.1": "Non-text Content",
-        "1.3.1": "Info and Relationships",
-        "1.3.2": "Meaningful Sequence",
-        "1.4.3": "Contrast (Minimum)",
-        "1.4.10": "Reflow",
-        "2.1.1": "Keyboard",
-        "2.4.1": "Bypass Blocks",
-        "2.4.2": "Page Titled",
-        "2.4.4": "Link Purpose (In Context)",
-        "2.4.6": "Headings and Labels",
-        "2.4.7": "Focus Visible",
-        "3.1.1": "Language of Page",
-        "3.2.3": "Consistent Navigation",
-        "3.3.2": "Labels or Instructions",
-        "4.1.1": "Parsing",
-        "4.1.2": "Name, Role, Value",
-    }
-    return refs.get(code, "")
-
-
-def add_issue(issues: List[Dict[str, Any]], severity: str, code: str, msg: str, nodes: List[str]):
-    issues.append({
-        "severity": severity,  # "high" | "medium" | "low"
-        "wcag": code,
-        "wcag_title": wcag_ref(code),
-        "message": msg,
-        "count": len(nodes),
-        "examples": nodes[:5],
-    })
-
-
-# ---------------------------- Audits ----------------------------
-
-def audit_html(html: str, base_url: Optional[str] = None) -> List[Dict[str, Any]]:
-    soup = BeautifulSoup(html, "lxml")
-    issues: List[Dict[str, Any]] = []
-
-    # 1) Language of page (3.1.1)
-    html_tag = soup.find("html")
-    if not html_tag or not html_tag.get("lang"):
-        add_issue(
-            issues, "medium", "3.1.1",
-            "Missing or empty lang attribute on <html>.",
-            [str(html_tag)[:120] if html_tag else "<html> not found"]
-        )
-
-    # 2) Page titled (2.4.2)
-    title = soup.find("title")
-    if not title or not title.get_text(strip=True):
-        add_issue(
-            issues, "medium", "2.4.2",
-            "Missing or empty <title> element.",
-            [str(title)[:120] if title else "<title> not found"]
-        )
-
-    # 3) Images alt text (1.1.1)
-    imgs = soup.find_all("img")
-    bad_imgs = []
-    for img in imgs:
-        alt = (img.get("alt") or "").strip()
-        role = (img.get("role") or "").strip().lower()
-        if role == "presentation":
+def normalize_wcag_codes(wcag_codes: Any) -> List[str]:
+    """Normalize input (None/str/list) to a list of bare n.n.n codes."""
+    if not wcag_codes:
+        return []
+    if isinstance(wcag_codes, str):
+        items = [wcag_codes]
+    elif isinstance(wcag_codes, (list, tuple, set)):
+        items = list(wcag_codes)
+    else:
+        return []
+    out = []
+    for item in items:
+        if not isinstance(item, str):
             continue
-        if alt == "" or len(alt) <= 1:
-            bad_imgs.append(str(img)[:180])
-    if bad_imgs:
-        add_issue(issues, "high", "1.1.1", "Images missing meaningful alt text.", bad_imgs)
+        m = WCAG_CODE_REGEX.search(item)
+        out.append(m.group(1) if m else item.strip())
+    # dedupe while preserving order
+    seen = set()
+    cleaned = []
+    for c in out:
+        if c and c not in seen:
+            cleaned.append(c)
+            seen.add(c)
+    return cleaned
 
-    # 4) Headings outline & single H1 (1.3.1, 2.4.6)
-    headings = [(h.name, h.get_text(" ", strip=True)) for h in soup.find_all(re.compile("^h[1-6]$"))]
-    h1_count = sum(1 for h, _ in headings if h == "h1")
-    if h1_count == 0:
-        add_issue(
-            issues, "medium", "2.4.6",
-            "No <h1> found. Provide a clear page heading.",
-            [f"{h}:{t[:80]}" for h, t in headings[:5]] or ["No headings present"]
-        )
-    level_seq = [int(h[1]) for h, _ in headings]
-    bad_seq = []
-    for i in range(1, len(level_seq)):
-        if level_seq[i] > level_seq[i-1] + 1:
-            bad_seq.append(f"{headings[i-1][0]} → {headings[i][0]} ({headings[i][1][:60]})")
-    if bad_seq:
-        add_issue(issues, "low", "1.3.1", "Heading levels skip order (e.g., h2 → h4).", bad_seq)
 
-    # 5) Links & buttons accessible name (2.4.4, 4.1.2)
-    bad_links = []
-    for a in soup.find_all("a"):
-        text = a.get_text(" ", strip=True)
-        name = text or a.get("aria-label") or a.get("title") or ""
-        href = a.get("href") or ""
-        if not name or name.lower() in {"", "click here", "here", "more", "read more"}:
-            bad_links.append(f"<a href='{href}'> {name or '[empty]'} </a>")
-    if bad_links:
-        add_issue(issues, "medium", "2.4.4", "Links must have a clear accessible name/purpose.", bad_links)
+def remediation_hints(wcag_codes: Any) -> List[str]:
+    codes = normalize_wcag_codes(wcag_codes)
+    hints: List[str] = []
+    for c in codes:
+        hint = WCAG_HINTS.get(c)
+        if hint and hint not in hints:
+            hints.append(hint)
+    return hints
 
-    bad_buttons = []
-    for b in soup.find_all(["button", "input"]):
-        role = b.get("role", "").lower()
-        if b.name == "input":
-            typ = (b.get("type") or "").lower()
-            is_buttonlike = typ in {"button", "submit", "reset", ""} or role == "button"
-        else:
-            is_buttonlike = True
-        if is_buttonlike:
-            name = (b.get_text(" ", strip=True) if b.name == "button" else (b.get("aria-label") or b.get("value") or ""))
-            if not name:
-                name = b.get("aria-label") or b.get("title") or ""
-            if not name:
-                bad_buttons.append(str(b)[:160])
-    if bad_buttons:
-        add_issue(issues, "medium", "4.1.2", "Buttons need an accessible name (text, aria-label, or title).", bad_buttons)
 
-    # 6) Form labels (3.3.2)
-    inputs = soup.find_all("input")
-    label_map: Dict[str, bool] = {}
-    for lab in soup.find_all("label"):
-        if lab.get("for"):
-            label_map[lab["for"]] = True
-    unlabeled = []
-    for inp in inputs:
-        typ = (inp.get("type") or "").lower()
-        if typ in {"hidden", "submit", "button", "reset", "image"}:
+def safe_get_wcag(item: Any) -> List[str]:
+    """Extract wcag codes from dict or object, robustly."""
+    val = None
+    if isinstance(item, dict):
+        val = item.get("wcag") or item.get("wcag_codes") or item.get("wcagId") or item.get("wcag_ids")
+    else:
+        for attr in ("wcag", "wcag_codes", "wcagId", "wcag_ids"):
+            if hasattr(item, attr):
+                val = getattr(item, attr)
+                break
+    return normalize_wcag_codes(val)
+
+# -----------------------------
+# Issue model
+# -----------------------------
+@dataclass
+class Issue:
+    id: str
+    title: str
+    severity: str  # "low" | "medium" | "high"
+    wcag: List[str]
+    location: str  # CSS selector / tag summary / URL section
+    snippet: str   # small text/HTML excerpt
+    recommendation: List[str]
+
+    def to_row(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "severity": self.severity,
+            "wcag": ", ".join(self.wcag) if self.wcag else "",
+            "location": self.location,
+            "snippet": self.snippet,
+            "recommendation": " | ".join(self.recommendation) if self.recommendation else "",
+        }
+
+# -----------------------------
+# Fetch & Parse
+# -----------------------------
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/117.0 Safari/537.36"
+)
+
+def fetch_url(url: str, timeout: int = 15) -> str:
+    """Fetch HTML from a URL; returns text or raises requests.exceptions.RequestException."""
+    headers = {"User-Agent": USER_AGENT}
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    # basic content-type gate (allow text/html)
+    ctype = resp.headers.get("content-type", "").lower()
+    if "html" not in ctype and "xml" not in ctype:
+        # still return text to allow some leniency
+        pass
+    return resp.text
+
+# -----------------------------
+# Heuristic checks
+# -----------------------------
+
+def summarize_tag(tag) -> str:
+    if not tag:
+        return ""
+    name = getattr(tag, "name", "") or ""
+    id_attr = tag.get("id", "") if hasattr(tag, 'get') else ""
+    cls = " ".join(tag.get("class", [])) if hasattr(tag, 'get') else ""
+    return f"<{name} id='{id_attr}' class='{cls}'>".strip()
+
+
+def first_text(tag, maxlen: int = 120) -> str:
+    if not tag:
+        return ""
+    txt = tag.get_text(strip=True)
+    return (txt[: maxlen - 1] + "…") if len(txt) > maxlen else txt
+
+
+def check_html_lang(soup: BeautifulSoup) -> List[Issue]:
+    issues: List[Issue] = []
+    html = soup.find("html")
+    lang = html.get("lang") if html else None
+    if not lang:
+        issues.append(Issue(
+            id="LANG-001",
+            title="Missing page language",
+            severity="medium",
+            wcag=["3.1.1"],
+            location="<html>",
+            snippet="No lang attribute on <html>.",
+            recommendation=remediation_hints(["3.1.1"]) or ["Add lang attribute, e.g., <html lang='en'>"],
+        ))
+    return issues
+
+
+def check_img_alt(soup: BeautifulSoup) -> List[Issue]:
+    issues: List[Issue] = []
+    imgs = soup.find_all("img")
+    for i, img in enumerate(imgs, start=1):
+        if img.has_attr("role") and img.get("role") == "presentation":
+            continue
+        if not img.has_attr("alt") or (img.get("alt") or "").strip() == "":
+            issues.append(Issue(
+                id=f"IMGALT-{i:03d}",
+                title="Image missing alt text",
+                severity="high",
+                wcag=["1.1.1"],
+                location=summarize_tag(img),
+                snippet=str(img)[:160] + ("…" if len(str(img)) > 160 else ""),
+                recommendation=remediation_hints(["1.1.1"]) or ["Add meaningful alt text describing the image purpose."],
+            ))
+    return issues
+
+
+def check_link_text(soup: BeautifulSoup) -> List[Issue]:
+    issues: List[Issue] = []
+    bad_texts = {"click here", "read more", "more", "here"}
+    anchors = soup.find_all("a")
+    for i, a in enumerate(anchors, start=1):
+        text = (a.get_text(" ", strip=True) or "").lower()
+        if text in bad_texts:
+            issues.append(Issue(
+                id=f"LINKTXT-{i:03d}",
+                title="Non-descriptive link text",
+                severity="medium",
+                wcag=["2.4.4"],
+                location=summarize_tag(a),
+                snippet=a.get_text(" ", strip=True)[:120],
+                recommendation=remediation_hints(["2.4.4"]) or ["Make link text describe the destination or action."],
+            ))
+    return issues
+
+
+def check_labels(soup: BeautifulSoup) -> List[Issue]:
+    issues: List[Issue] = []
+    inputs = soup.find_all(["input", "select", "textarea"])
+    # Build map of label[for]
+    labels = {lbl.get("for"): lbl for lbl in soup.find_all("label") if lbl.get("for")}
+    for i, el in enumerate(inputs, start=1):
+        # Skip hidden inputs
+        if el.name == "input" and el.get("type") == "hidden":
             continue
         has_label = False
-        _id = inp.get("id")
-        if _id and _id in label_map:
+        # 1) Explicit label via id/for
+        eid = el.get("id")
+        if eid and eid in labels:
+            has_label = True
+        # 2) Implicit label wrapping the input
+        if not has_label:
+            parent = el.parent
+            if parent and parent.name == "label":
+                has_label = True
+        # 3) aria-label or aria-labelledby acceptable
+        if not has_label and (el.get("aria-label") or el.get("aria-labelledby")):
             has_label = True
         if not has_label:
-            if inp.get("aria-label") or inp.get("aria-labelledby") or inp.get("title"):
-                has_label = True
-        if not has_label:
-            unlabeled.append(str(inp)[:160])
-    if unlabeled:
-        add_issue(issues, "high", "3.3.2", "Inputs missing labels or accessible names.", unlabeled)
+            issues.append(Issue(
+                id=f"LABEL-{i:03d}",
+                title="Form control missing accessible label",
+                severity="high",
+                wcag=["3.3.2"],
+                location=summarize_tag(el),
+                snippet=str(el)[:160] + ("…" if len(str(el)) > 160 else ""),
+                recommendation=remediation_hints(["3.3.2"]) or ["Associate a <label> or aria-label/aria-labelledby with the form control."],
+            ))
+    return issues
 
-    # 7) Duplicate IDs (4.1.1)
-    ids: Dict[str, int] = {}
-    dups: List[str] = []
-    for el in soup.find_all(True):
-        _id = el.get("id")
-        if _id:
-            ids[_id] = ids.get(_id, 0) + 1
-    for k, v in ids.items():
-        if v > 1:
-            dups.append(f"id='{k}' appears {v} times")
-    if dups:
-        add_issue(issues, "low", "4.1.1", "Duplicate element IDs found.", dups)
 
-    # 8) Meta viewport (1.4.10 Reflow – partial heuristic)
-    vp = soup.find("meta", attrs={"name": "viewport"})
-    if not vp:
-        add_issue(issues, "low", "1.4.10", "Missing <meta name='viewport'> may hinder reflow on mobile.", ["<meta name='viewport' ...> not found"])
+def check_headings_order(soup: BeautifulSoup) -> List[Issue]:
+    issues: List[Issue] = []
+    headings = []
+    for level in range(1, 7):
+        for h in soup.find_all(f"h{level}"):
+            headings.append((level, h))
+    # Keep document order
+    headings.sort(key=lambda x: x[1].sourceline if hasattr(x[1], 'sourceline') and x[1].sourceline else 0)
+    last_level = 1
+    for idx, (level, tag) in enumerate(headings, start=1):
+        # Allow same level or +1 deeper; flag big jumps (e.g., h1 -> h4)
+        if level > last_level + 1:
+            issues.append(Issue(
+                id=f"HEADINGS-{idx:03d}",
+                title="Heading level jumps by more than one",
+                severity="low",
+                wcag=["1.3.1", "2.4.6"],
+                location=summarize_tag(tag),
+                snippet=first_text(tag),
+                recommendation=remediation_hints(["1.3.1", "2.4.6"]) or ["Use headings sequentially (e.g., h2 under h1, not h4)."],
+            ))
+        last_level = level
+    return issues
 
-    # 9) Inline contrast (1.4.3) — heuristic
-    low_contrast: List[str] = []
-    for el in soup.find_all(True):
-        style = el.get("style", "")
-        if not style:
-            continue
-        fg = parse_color(style)
-        bg = None
+
+def analyze_html(html: str, url: Optional[str] = None) -> List[Issue]:
+    soup = BeautifulSoup(html, "html.parser")
+    issues: List[Issue] = []
+    for fn in (check_html_lang, check_img_alt, check_link_text, check_labels, check_headings_order):
         try:
-            m = re.search(r"background(?:-color)?\s*:\s*([^;]+)", style, re.I)
-            if m and HAS_PIL:
-                from PIL import ImageColor as _IC
-                bg = _IC.getrgb(m.group(1).strip())
-        except Exception:
-            bg = None
-        if fg:
-            if not bg:
-                bg = (255, 255, 255)
-            try:
-                cr = contrast_ratio(fg, bg)
-                if cr < 4.5:
-                    txt = el.get_text(" ", strip=True)[:80]
-                    low_contrast.append(f"contrast≈{cr:.2f} | '{txt}' | style='{style[:80]}'")
-            except Exception:
-                pass
-    if low_contrast:
-        add_issue(issues, "high", "1.4.3", "Possible insufficient color contrast (inline styles).", low_contrast)
-
-    # 10) Basic ARIA misuse scan (4.1.2)
-    bad_aria: List[str] = []
-    for el in soup.find_all(True):
-        role = el.get("role")
-        aria_hidden = el.get("aria-hidden")
-        if aria_hidden == "true":
-            if el.name in {"a", "button", "input", "textarea", "select"}:
-                bad_aria.append(f"{el.name} has aria-hidden='true' but is interactive")
-        if role == "presentation" and el.name in {"a", "button", "input"}:
-            bad_aria.append(f"{el.name} should not use role='presentation'")
-    if bad_aria:
-        add_issue(issues, "low", "4.1.2", "Potential ARIA misuse.", bad_aria)
-
+            issues.extend(fn(soup))
+        except Exception as e:  # keep going even if one checker fails
+            issues.append(Issue(
+                id=f"CHECKERR-{fn.__name__}",
+                title=f"Checker error in {fn.__name__}",
+                severity="low",
+                wcag=[],
+                location=url or "(input)",
+                snippet=str(e),
+                recommendation=["Checker crashed; please report this case."],
+            ))
     return issues
 
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="Accessibility Auditor (WCAG)", page_icon="♿", layout="wide")
 
-def audit_pdf(text: str) -> List[Dict[str, Any]]:
-    issues: List[Dict[str, Any]] = []
-    if not text or text.strip() == "":
-        add_issue(
-            issues, "high", "1.1.1",
-            "PDF appears to have no selectable text (likely scanned without OCR).",
-            ["No text extracted"]
-        )
-    return issues
-
-
-def crawl_and_collect(url: str, depth: int = 0, max_pages: int = 5, path_prefix: str = "") -> List[Tuple[str, Optional[str]]]:
-    """
-    Return list of (url, html_text) for same-origin pages up to depth,
-    restricted to optional path_prefix (e.g., '/services').
-    """
-    seen: Set[str] = set()
-    out: List[Tuple[str, Optional[str]]] = []
-    base = url
-    q: List[Tuple[str, int]] = [(url, 0)]
-    while q and len(out) < max_pages:
-        u, d = q.pop(0)
-        if u in seen:
-            continue
-        seen.add(u)
-        html = fetch_url(u)
-        out.append((u, html))
-        if d < depth and html:
-            try:
-                soup = BeautifulSoup(html, "lxml")
-                for a in soup.find_all("a", href=True):
-                    nxt = urljoin(u, a["href"])
-                    if nxt.startswith(("mailto:", "tel:", "javascript:")):
-                        continue
-                    if allow_url(base, nxt, prefix=path_prefix):
-                        q.append((nxt, d + 1))
-                        if len(q) > max_pages * 2:
-                            q = q[:max_pages * 2]
-            except Exception:
-                pass
-    return out
-
-
-# ---------------------- Remediation Plan (LLM) ----------------------
-
-def llm_available() -> bool:
-    return bool(HAS_OPENAI and OPENAI_API_KEY)
-
-
-def remediation_plan(issues: List[Dict[str, Any]], target: str) -> str:
-    if not llm_available():
-        return (
-            "⚠️ OpenAI not configured. Set OPENAI_API_KEY to generate a remediation plan.\n\n"
-            f"Target: {target}\n\n"
-            f"Here is the raw JSON of issues you can use:\n{json.dumps(issues, indent=2)[:5000]}"
-        )
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        summary = json.dumps(issues, ensure_ascii=False)
-        prompt = f"""
-You are an experienced WCAG 2.2 AA accessibility consultant.
-Given this audit (JSON array of issues with wcag code, severity, counts, and examples), produce:
-
-1) Executive summary (non-technical, 3–5 bullets).
-2) Prioritized remediation backlog (P0/P1/P2), grouped by WCAG criterion.
-3) Concrete code-level fixes (CSS/HTML/ARIA) with short snippets where relevant.
-4) Owner suggestions (Design, Frontend, Content) and realistic timelines (Quick Wins: <1 day, Short: <1 week, Medium: 2–4 weeks).
-5) A re-test checklist.
-
-Target: {target}
-
-Audit JSON:
-{summary}
-"""
-        resp = client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": "You deliver precise, standards-based accessibility guidance."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        return f"❌ LLM call failed: {e}\n\n{traceback.format_exc()}"
-
-
-# ---------------------------- UI ----------------------------
-
-st.title("♿ AI Accessibility Auditor")
-st.caption("WCAG 2.2 AA checks for URLs, HTML, and PDFs. Generate reports & a remediation plan.")
+st.title("♿ Accessibility Auditor — WCAG quick-check")
+st.markdown(
+    "Scan a web page or pasted HTML for common accessibility issues. "
+    "This is a heuristic pre-check — not a full audit."
+)
 
 with st.sidebar:
-    st.subheader("Audit Target")
-    mode = st.radio("Choose input type:", ["URL", "Upload HTML", "Upload PDF"], index=0)
+    st.header("Input")
+    mode = st.radio("Choose input mode", ["URL", "Paste HTML", "Upload .html"], index=0)
+    show_debug = st.checkbox("Debug mode", value=False)
 
-    crawl_depth = 0
-    max_pages = 5
-    base_url = ""
-    uploaded_html = None
-    uploaded_pdf = None
-    path_prefix = ""
+    st.markdown("---")
+    st.caption("WCAG checks covered in this quick scan:")
+    st.write("- Page language (3.1.1)\n- Image alt text (1.1.1)\n- Link text descriptiveness (2.4.4)\n- Form labels (3.3.2)\n- Heading order (1.3.1, 2.4.6)")
 
-    if mode == "URL":
-        base_url = st.text_input("URL to audit", placeholder="https://www.example.com")
-        path_prefix = st.text_input("Restrict to path (optional)", value="", help="e.g., /services")
-        crawl_depth = st.slider("Crawl depth (same origin)", 0, 1, 0, help="Depth 0 = single page; Depth 1 ≈ follow internal links.")
-        max_pages = st.slider("Max pages", 1, 20, 5)
+html_text: Optional[str] = None
+source_label = ""
 
-        # Convenience: 1-click Wyndham demo
-        if st.button("Demo Audit (Wyndham /services)"):
-            base_url = "https://www.wyndham.vic.gov.au/services"
-            path_prefix = "/services"
-            st.session_state["__demo_params"] = dict(url=base_url, prefix=path_prefix, depth=1, max_pages=8)
-            st.experimental_rerun()
+if mode == "URL":
+    url = st.text_input("Enter a URL", placeholder="https://www.example.com")
+    if st.button("Analyze URL", type="primary"):
+        if not url:
+            st.error("Please enter a URL.")
+        else:
+            try:
+                with st.spinner("Fetching page…"):
+                    html_text = fetch_url(url)
+                source_label = url
+            except requests.exceptions.RequestException as e:
+                st.error(f"Failed to fetch: {e}")
 
-    elif mode == "Upload HTML":
-        uploaded_html = st.file_uploader("Upload .html", type=["html", "htm"])
+elif mode == "Paste HTML":
+    html_text = st.text_area("Paste HTML here", height=300)
+    source_label = "(pasted HTML)"
+    st.info("Click the Analyze button when ready.")
+    st.button("Analyze pasted HTML", type="primary")
+
+else:  # Upload .html
+    up = st.file_uploader("Upload an .html file", type=["html", "htm"])
+    if up:
+        try:
+            content = up.read().decode("utf-8", errors="replace")
+            html_text = content
+            source_label = up.name
+            st.success(f"Loaded {up.name}")
+        except Exception as e:
+            st.error(f"Failed to read file: {e}")
+
+# Gate to run analysis (for Paste HTML mode we also require a click, so guard by session)
+run = False
+if mode == "URL":
+    run = html_text is not None
+elif mode == "Paste HTML":
+    # Require explicit analyze click
+    run = st.session_state.get("analyze_paste_clicked", False)
+    # Set when the button above is clicked
+    for k in st.session_state.keys():
+        pass
+    # Workaround: Use on_click in a lightweight way
+    def _set_clicked():
+        st.session_state["analyze_paste_clicked"] = True
+    st.button("Analyze", on_click=_set_clicked, key="analyze_paste_btn")
+    if st.session_state.get("analyze_paste_clicked") and html_text:
+        run = True
+elif mode == "Upload .html":
+    run = html_text is not None
+
+if run and html_text:
+    with st.spinner("Analyzing HTML…"):
+        issues = analyze_html(html_text, url=source_label)
+
+    # Summaries
+    total = len(issues)
+    high = sum(1 for i in issues if i.severity == "high")
+    med = sum(1 for i in issues if i.severity == "medium")
+    low = sum(1 for i in issues if i.severity == "low")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total issues", total)
+    c2.metric("High", high)
+    c3.metric("Medium", med)
+    c4.metric("Low", low)
+
+    # Table view
+    rows = [iss.to_row() for iss in issues]
+    st.subheader("Results")
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
-        uploaded_pdf = st.file_uploader("Upload .pdf", type=["pdf"])
+        st.success("No issues detected by these checks.")
 
-    st.divider()
-    st.subheader("Export & Plan")
-    want_plan = st.toggle("Generate remediation plan (OpenAI)", value=False)
-    st.caption("Set OPENAI_API_KEY to enable.")
+    # Detail expanders
+    st.subheader("Details")
+    for iss in issues:
+        with st.expander(f"[{iss.severity.upper()}] {iss.title} — {iss.id}"):
+            st.write(f"**Location:** {iss.location}")
+            if iss.wcag:
+                st.write("**WCAG:** ", ", ".join(iss.wcag))
+            if iss.recommendation:
+                st.write("**Recommendations:**")
+                for rec in iss.recommendation:
+                    st.write(f"- {rec}")
+            if iss.snippet:
+                st.code(iss.snippet, language="html")
 
-col_report, col_right = st.columns([2, 1])
+    # Downloads
+    st.subheader("Export")
+    csv_buf = io.StringIO()
+    # Build CSV manually to avoid pandas dependency
+    headers = ["id", "title", "severity", "wcag", "location", "snippet", "recommendation"]
+    csv_buf.write(",".join(headers) + "\n")
+    for r in rows:
+        line = [
+            r.get("id", ""),
+            r.get("title", ""),
+            r.get("severity", ""),
+            r.get("wcag", ""),
+            r.get("location", "").replace("\n", " "),
+            r.get("snippet", "").replace(",", " ").replace("\n", " ")[:500],
+            r.get("recommendation", "").replace(",", ";").replace("\n", " ")[:500],
+        ]
+        csv_buf.write(",".join([json.dumps(x)[1:-1] for x in line]) + "\n")
+    st.download_button("Download CSV", data=csv_buf.getvalue(), file_name="wcag_issues.csv", mime="text/csv")
 
-with col_report:
-    st.subheader("Audit Report")
+    json_data = json.dumps([asdict(i) for i in issues], ensure_ascii=False, indent=2)
+    st.download_button("Download JSON", data=json_data, file_name="wcag_issues.json", mime="application/json")
 
-    issues_all: List[Dict[str, Any]] = []
-    pages_audited: List[str] = []
+    if show_debug:
+        st.subheader("Debug")
+        st.text_area("Raw HTML (truncated)", html_text[:4000], height=200)
+        st.write("Parsed issues (Python objects):")
+        st.write(issues)
 
-    # Handle demo params if present
-    demo_params = st.session_state.pop("__demo_params", None)
+else:
+    st.info("Provide input and click Analyze to run the checks.")
 
-    if mode == "URL":
-        run_clicked = st.button("Run Audit", type="primary", use_container_width=True)
-        if demo_params:
-            base_url = demo_params["url"]
-            path_prefix = demo_params["prefix"]
-            crawl_depth = demo_params["depth"]
-            max_pages = demo_params["max_pages"]
-            run_clicked = True  # force run with demo params
-
-        if run_clicked:
-            if not base_url.strip():
-                st.warning("Please enter a URL.")
-            else:
-                with st.spinner(f"Fetching and analyzing (depth={crawl_depth}, max_pages={max_pages}, prefix='{path_prefix or '/'}')..."):
-                    pages = crawl_and_collect(base_url.strip(), depth=crawl_depth, max_pages=max_pages, path_prefix=path_prefix.strip())
-                    for u, html in pages:
-                        pages_audited.append(u)
-                        if html:
-                            issues = audit_html(html, base_url=u)
-                            for it in issues:
-                                it["page"] = u
-                            issues_all.extend(issues)
-                        else:
-                            issues_all.append({
-                                "severity": "high",
-                                "wcag": "4.1.1",
-                                "wcag_title": wcag_ref("4.1.1"),
-                                "message": "Page not HTML or failed to load content.",
-                                "count": 1,
-                                "examples": [u],
-                                "page": u,
-                            })
-
-    elif mode == "Upload HTML":
-        if st.button("Run Audit", type="primary", use_container_width=True):
-            if not uploaded_html:
-                st.warning("Please upload an HTML file.")
-            else:
-                with st.spinner("Analyzing HTML..."):
-                    html_text = uploaded_html.read().decode("utf-8", errors="ignore")
-                    pages_audited.append(uploaded_html.name)
-                    issues_all = audit_html(html_text)
-                    for it in issues_all:
-                        it["page"] = uploaded_html.name
-
-    else:
-        if st.button("Run Audit", type="primary", use_container_width=True):
-            if not uploaded_pdf:
-                st.warning("Please upload a PDF.")
-            else:
-                with st.spinner("Reading PDF..."):
-                    text = read_pdf_bytes(uploaded_pdf)
-                    pages_audited.append(uploaded_pdf.name)
-                    issues_all = audit_pdf(text)
-                    for it in issues_all:
-                        it["page"] = uploaded_pdf.name
-
-    if issues_all:
-        # Summary chips
-        sev_counts = {"high": 0, "medium": 0, "low": 0}
-        for it in issues_all:
-            sev_counts[it["severity"]] = sev_counts.get(it["severity"], 0) + it.get("count", 1)
-
-        st.markdown(
-            f"""
-**Pages audited:** {len(set(pages_audited))}  
-**Issues (approx counts by severity):**  
-- 🔴 High: **{sev_counts.get('high', 0)}**  
-- 🟠 Medium: **{sev_counts.get('medium', 0)}**  
-- 🟡 Low: **{sev_counts.get('low', 0)}**
-"""
-        )
-
-        # Table-like details
-        for i, it in enumerate(issues_all, start=1):
-            with st.expander(f"{i}. [{it['severity'].upper()}] WCAG {it['wcag']} {('— ' + it['wcag_title']) if it.get('wcag_title') else ''} — {it['message']}  (page: {it.get('page','')})"):
-                st.write(f"**Count:** {it['count']}")
-                if it.get("examples"):
-                    st.code("\n\n".join(it["examples"]), language="html")
-                st.markdown("**Remediation tips:**")
-                hints = remediation_hints(it["wcag"])
-                if hints:
-                    st.markdown(hints)
-                else:
-                    st.write("Provide semantic HTML, proper ARIA if needed, and ensure keyboard and screen reader support.")
-
-        # Export
-        st.subheader("Export")
-        as_json = json.dumps(issues_all, ensure_ascii=False, indent=2)
-        st.download_button("Download JSON", as_json, file_name="accessibility_report.json", mime="application/json")
-        import csv
-        from io import StringIO
-        csv_buf = StringIO()
-        writer = csv.writer(csv_buf)
-        writer.writerow(["page", "severity", "wcag", "wcag_title", "message", "count", "example"])
-        for it in issues_all:
-            exs = it.get("examples", []) or [""]
-            for ex in exs:
-                writer.writerow([it.get("page",""), it["severity"], it["wcag"], it.get("wcag_title",""), it["message"], it["count"], ex])
-        st.download_button("Download CSV", csv_buf.getvalue(), file_name="accessibility_report.csv", mime="text/csv")
-
-        st.divider()
-
-        if want_plan:
-            target = (base_url or (uploaded_html.name if uploaded_html else uploaded_pdf.name if uploaded_pdf else "Uploaded file"))
-            st.subheader("Remediation Plan")
-            with st.spinner("Drafting plan..."):
-                plan = remediation_plan(issues_all, target)
-                st.write(plan)
-    else:
-        st.info("Run an audit to see results here.")
-
-with col_right:
-    st.subheader("Guidance & Scope")
-    st.markdown(
-        """
-This tool runs pragmatic WCAG 2.2 AA checks:
-
-- **Document**: `<html lang>`, `<title>`, `<meta viewport>`
-- **Structure**: heading presence/order, duplicate IDs
-- **Text alternatives**: `<img alt>`
-- **Navigation/Controls**: link and button names
-- **Forms**: labels or accessible names
-- **Visual**: inline color contrast (heuristic)
-- **PDFs**: checks for extractable text (OCR hint)
-
-For full coverage (JS/CSS/ARIA in runtime), pair with a headless runner (axe-core/pa11y) in CI.
-"""
-    )
-    st.divider()
-    st.markdown("**OpenAI status:** " + ("✅ enabled" if llm_available() else "⚠️ not configured"))
-
-# ---------------------- Remediation Hints ----------------------
-
-def remediation_hints(wcag_code: str) -> str:
-    tips = {
-        "1.1.1": """
-- Provide meaningful `alt` for informative images; decorative images should use `alt=""` or `role="presentation"`.
-- Avoid repeating nearby text; keep alt concise and specific.""",
-        "1.3.1": """
-- Use proper heading levels (`h1`..`h6`) without skipping.
-- Convey structure with semantic HTML (lists, tables with headers).""",
-        "1.4.3": """
-- Ensure contrast ratio ≥ 4.5:1 for normal text (3:1 for large text).
-- Adjust colors or add background, avoid text over images without overlay.""",
-        "1.4.10": """
-- Include `<meta name="viewport" content="width=device-width, initial-scale=1">`.
-- Ensure layouts reflow without two-dimensional scrolling.""",
-        "2.4.2": """
-- Provide a concise, unique `<title>` describing the page purpose.""",
-        "2.4.4": """
-- Ensure links have clear, descriptive text (avoid “Click here”).
-- Use `aria-label` or `title` only when visible text cannot be used.""",
-        "2.4.6": """
-- Use headings and labels that describe topic or purpose.""",
-        "3.1.1": """
-- Set the primary language on `<html lang="en">` (or your language code).""",
-        "3.3.2": """
-- Associate labels with form fields using `<label for="id">` and `id`.
-- Alternatively, ensure `aria-label`/`aria-labelledby` is present and meaningful.""",
-        "4.1.1": """
-- Ensure valid HTML without duplicate IDs and with properly nested elements.""",
-        "4.1.2": """
-- Interactive controls must expose name/role/state programmatically.
-- Prefer native elements; use ARIA only when necessary and correctly."""
-    }
-    return tips.get(wcag_code, "")
+st.markdown("---")
+st.caption(
+    "This is a heuristic scanner to help you spot common problems quickly. "
+    "For compliance, conduct a full WCAG 2.x evaluation with manual testing, keyboard checks, and assistive technologies.")
