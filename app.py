@@ -1,17 +1,36 @@
-# app.py — Accessibility Auditor (WCAG Quick-Check) with Wyndham presets
-# Run: streamlit run app.py
+# app.py — Accessibility Auditor 2.0 (Wyndham-specialized)
+# Run locally:  streamlit run app.py
+# Requires: streamlit, requests, beautifulsoup4, pandas, pypdf, reportlab, pillow
+# Optional (already common): python-dotenv
 
-import re, json
+import os, io, re, time, math, json, datetime
+from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
-from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup, Tag
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
-# ---------- Brand / Council presets ----------
+# ------- PDF utilities (pypdf) -------
+from pypdf import PdfReader
+
+# ------- Report generation (reportlab) -------
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib import utils
+from reportlab.lib.units import mm
+
+# ==========================
+# Wyndham presets & branding
+# ==========================
 WYNDHAM = {
     "name": "Wyndham City Council",
     "logo": "https://www.wyndham.vic.gov.au/themes/custom/wyndham/logo.png",
@@ -21,507 +40,579 @@ WYNDHAM = {
         "Waste & Recycling": "https://www.wyndham.vic.gov.au/services/waste-recycling",
         "Bin days": "https://www.wyndham.vic.gov.au/residents/waste-recycling/bin-collection",
         "Hard waste": "https://www.wyndham.vic.gov.au/services/waste-recycling/hard-and-green-waste-collection-service",
-        "Accessibility statement": "https://www.wyndham.vic.gov.au/accessibility",
-    },
-    "quick_targets": [
-        "https://www.wyndham.vic.gov.au/services/waste-recycling",
-        "https://www.wyndham.vic.gov.au/residents/waste-recycling/bin-collection",
-        "https://www.wyndham.vic.gov.au/services/planning-building",
-        "https://www.wyndham.vic.gov.au/residents/parking-roads",
-    ],
+        "Accessibility statement": "https://www.wyndham.vic.gov.au/accessibility"
+    }
 }
 
-APP_NAME = "Accessibility Auditor — WCAG Quick-Check"
-st.set_page_config(page_title=APP_NAME, page_icon="✅", layout="wide")
+DATA_DIR = ".audits"
+AUDITS_CSV = os.path.join(DATA_DIR, "audits.csv")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+st.set_page_config(
+    page_title="Accessibility Auditor — Wyndham",
+    page_icon="✅",
+    layout="wide"
+)
+
+# =====================
+# Utility: Color / WCAG
+# =====================
+HEX_RE = re.compile(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})\b")
+RGBA_RE = re.compile(r"rgba?\(([^)]+)\)")
 
 
-# ---------- Helpers ----------
-def short(text: str, limit: int = 140) -> str:
-    s = " ".join((text or "").split())
-    return s[: limit - 1] + "…" if len(s) > limit else s
+def normalize_hex(h: str) -> str:
+    if not h:
+        return "#000000"
+    h = h.strip()
+    if not h.startswith("#"):
+        return h
+    if len(h) == 4:
+        # #abc -> #aabbcc
+        return "#" + "".join([c * 2 for c in h[1:]])
+    return h
 
 
-@st.cache_data(show_spinner=False, ttl=300)
-def fetch(url: str, timeout: int = 12) -> Tuple[str, str]:
-    """Fetch URL and return (final_url, html). Raises if non-HTML."""
-    headers = {"User-Agent": "Mozilla/5.0 (WCAG-QuickCheck; +https://example.local)"}
-    r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-    ctype = r.headers.get("content-type", "")
-    if "text/html" not in ctype:
-        raise ValueError(f"URL is not HTML (content-type: {ctype})")
-    r.raise_for_status()
-    r.encoding = r.apparent_encoding or r.encoding
-    return r.url, r.text
+def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    hex_color = normalize_hex(hex_color)
+    if not hex_color.startswith("#"):
+        return (0, 0, 0)
+    r = int(hex_color[1:3], 16)
+    g = int(hex_color[3:5], 16)
+    b = int(hex_color[5:7], 16)
+    return (r, g, b)
 
 
-def label_targeted(soup: BeautifulSoup, el: Tag) -> bool:
-    """Is there a <label for=id>, wrapping <label>, aria-labelledby (with text) or aria-label?"""
-    if not el:
-        return False
-    # Wrapped by a <label>
-    p = el.parent
-    while p and isinstance(p, Tag):
-        if p.name == "label" and p.get_text(strip=True):
-            return True
-        p = p.parent
-    # <label for="">
-    el_id = el.get("id")
-    if el_id:
-        lab = soup.find("label", attrs={"for": el_id})
-        if lab and lab.get_text(strip=True):
-            return True
-    # aria-labelledby targets with text
-    ll = el.get("aria-labelledby")
-    if ll:
-        for _id in str(ll).split():
-            tgt = soup.find(id=_id)
-            if tgt and tgt.get_text(strip=True):
-                return True
-    # aria-label
-    if el.get("aria-label"):
-        return True
-    return False
+def parse_css_color(val: Optional[str]) -> Tuple[int, int, int]:
+    """Parse inline CSS color value into RGB (0-255). Defaults to black/white fallbacks."""
+    if not val:
+        return (0, 0, 0)
+    val = val.strip()
+    if HEX_RE.match(val):
+        return hex_to_rgb(val)
+    m = RGBA_RE.match(val)
+    if m:
+        parts = [p.strip() for p in m.group(1).split(",")]
+        if len(parts) >= 3:
+            try:
+                r = int(float(parts[0]))
+                g = int(float(parts[1]))
+                b = int(float(parts[2]))
+                return (r, g, b)
+            except Exception:
+                pass
+    # named colors or unknown -> fallback to black
+    return (0, 0, 0)
 
 
-def has_accessible_name(el: Tag, soup: BeautifulSoup) -> bool:
-    """Does a button/link have an accessible name?"""
-    if not el:
-        return False
-    if el.get_text(strip=True):
-        return True
-    for attr in ("aria-label", "title"):
-        if el.has_attr(attr) and str(el[attr]).strip():
-            return True
-    if el.has_attr("aria-labelledby"):
-        for ref_id in str(el["aria-labelledby"]).split():
-            tgt = soup.find(id=ref_id)
-            if tgt and tgt.get_text(strip=True):
-                return True
-    if el.name == "input" and el.get("type") == "image" and el.get("alt"):
-        return True
-    if el.name == "svg" and el.get("aria-label"):
-        return True
-    return False
+def srgb_to_linear(c: float) -> float:
+    c = c / 255.0
+    if c <= 0.03928:
+        return c / 12.92
+    return ((c + 0.055) / 1.055) ** 2.4
 
 
-# ---- Contrast utilities (simple / inline styles only) ----
-def _parse_color(val: str) -> Optional[Tuple[float, float, float]]:
-    val = (val or "").strip().lower()
-    if val.startswith("#"):
-        h = val[1:]
-        if len(h) == 3:
-            r, g, b = [int(c * 2, 16) for c in h]
-        elif len(h) == 6:
-            r, g, b = [int(h[i : i + 2], 16) for i in (0, 2, 4)]
-        else:
-            return None
-        return (r / 255.0, g / 255.0, b / 255.0)
-    if val.startswith("rgb"):
-        nums = re.findall(r"[\d.]+", val)
-        if len(nums) >= 3:
-            r, g, b = [min(255, max(0, int(float(n)))) for n in nums[:3]]
-            return (r / 255.0, g / 255.0, b / 255.0)
-    return None
+def relative_luminance(rgb: Tuple[int, int, int]) -> float:
+    r, g, b = rgb
+    R = srgb_to_linear(r)
+    G = srgb_to_linear(g)
+    B = srgb_to_linear(b)
+    return 0.2126 * R + 0.7152 * G + 0.0722 * B
 
 
-def _rel_lum(rgb: Tuple[float, float, float]) -> float:
-    def lin(c):
-        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
-    r, g, b = [lin(c) for c in rgb]
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+def contrast_ratio(fg: Tuple[int, int, int], bg: Tuple[int, int, int]) -> float:
+    L1 = relative_luminance(fg)
+    L2 = relative_luminance(bg)
+    L_light = max(L1, L2)
+    L_dark = min(L1, L2)
+    return (L_light + 0.05) / (L_dark + 0.05)
 
 
-def _contrast_ratio(fg: Tuple[float, float, float], bg: Tuple[float, float, float]) -> float:
-    L1, L2 = sorted([_rel_lum(fg), _rel_lum(bg)], reverse=True)
-    return (L1 + 0.05) / (L2 + 0.05)
+def passes_wcag_aa(cr: float, font_size_px: Optional[float] = None, bold: bool = False) -> bool:
+    """WCAG 1.4.3 thresholds: 4.5:1 normal text, 3:1 for large (>=18pt ~ 24px or 14pt bold ~ 18.66px)."""
+    if font_size_px is None:
+        return cr >= 4.5
+    # rough mapping: assume 1pt ≈ 1.3333px
+    pt = font_size_px / 1.3333
+    is_large = pt >= 18 or (bold and pt >= 14)
+    return cr >= (3.0 if is_large else 4.5)
 
 
-# ---------- Data models ----------
+# =====================
+# HTML analysis helpers
+# =====================
+TEXT_TAGS = {"p", "span", "a", "li", "button", "label", "small", "em", "strong", "div", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+def get_inline_style_color(tag: Tag) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], Optional[float], bool]:
+    style = tag.get("style", "") or ""
+    # Very light-weight parsing; we do NOT compute cascading CSS or external styles.
+    fg = (0, 0, 0)
+    bg = (255, 255, 255)
+    size_px: Optional[float] = None
+    bold = False
+
+    parts = [p.strip() for p in style.split(";") if p.strip()]
+    for p in parts:
+        if ":" not in p:
+            continue
+        k, v = p.split(":", 1)
+        k = k.strip().lower()
+        v = v.strip().lower()
+        if k == "color":
+            fg = parse_css_color(v)
+        elif k == "background-color":
+            bg = parse_css_color(v)
+        elif k == "font-weight":
+            bold = ("bold" in v) or (v.isdigit() and int(v) >= 600)
+        elif k == "font-size":
+            try:
+                if v.endswith("px"):
+                    size_px = float(v[:-2])
+                elif v.endswith("rem"):
+                    size_px = float(v[:-3]) * 16.0
+                elif v.endswith("em"):
+                    size_px = float(v[:-2]) * 16.0
+            except Exception:
+                pass
+
+    return fg, bg, size_px, bold
+
+
 @dataclass
-class Issue:
-    id: str
-    title: str
-    severity: str  # high/medium/low
-    wcag: str
-    location: str
-    snippet: str
-    recommendation: str
+class ContrastIssue:
+    tag: str
+    text: str
+    fg: str
+    bg: str
+    ratio: float
+    size_px: Optional[float]
+    bold: bool
+    selector_hint: str
 
 
-def issues_df(issues: List[Issue]) -> pd.DataFrame:
-    return pd.DataFrame([asdict(i) for i in issues])
+@dataclass
+class ImgAltIssue:
+    src: str
+    suggestion: str
 
 
-def counts(df: pd.DataFrame) -> Dict[str, int]:
-    if df.empty:
-        return {"high": 0, "medium": 0, "low": 0}
+def analyze_html(url: str) -> Dict:
+    res = requests.get(url, timeout=15)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    contrast_issues: List[ContrastIssue] = []
+    text_checked = 0
+    pass_count = 0
+
+    for el in soup.find_all(TEXT_TAGS):
+        # Skip if no visible text
+        text = (el.get_text(strip=True) or "")[:120]
+        if not text:
+            continue
+        text_checked += 1
+        fg_rgb, bg_rgb, size_px, bold = get_inline_style_color(el)
+        cr = contrast_ratio(fg_rgb, bg_rgb)
+        if passes_wcag_aa(cr, size_px, bold):
+            pass_count += 1
+        else:
+            contrast_issues.append(
+                ContrastIssue(
+                    tag=el.name,
+                    text=text,
+                    fg="#%02x%02x%02x" % fg_rgb,
+                    bg="#%02x%02x%02x" % bg_rgb,
+                    ratio=round(cr, 2),
+                    size_px=size_px,
+                    bold=bold,
+                    selector_hint=(el.get("id") or el.get("class") or "") and str(el)[:120]
+                )
+            )
+
+    # Image alt checks
+    img_issues: List[ImgAltIssue] = []
+    for img in soup.find_all("img"):
+        alt = (img.get("alt") or "").strip()
+        if alt == "":
+            src = img.get("src") or ""
+            full_src = urljoin(url, src)
+            img_issues.append(ImgAltIssue(src=full_src, suggestion="Add descriptive alt text, e.g., alt=\"Council logo\""))
+
+    # Simple score: (passes / checked)
+    score = 0.0
+    if text_checked > 0:
+        score = (pass_count / text_checked) * 100.0
+
     return {
-        "high": int((df["severity"] == "high").sum()),
-        "medium": int((df["severity"] == "medium").sum()),
-        "low": int((df["severity"] == "low").sum()),
+        "score": round(score, 2),
+        "checked": text_checked,
+        "pass_count": pass_count,
+        "contrast_issues": [asdict(i) for i in contrast_issues],
+        "img_alt_issues": [asdict(i) for i in img_issues],
+        "html_size_bytes": len(res.text.encode("utf-8")),
+        "title": soup.title.string if soup.title else "",
     }
 
 
-# ---------- Analyzer ----------
-def analyze(
-    html: str,
-    url: str,
-    council: Optional[str] = None,
-    check_contrast: bool = False,
-    check_footer_access_link: bool = True,
-    check_pdf_links: bool = True,
-    check_tabindex: bool = True,
-) -> List[Issue]:
-    soup = BeautifulSoup(html, "html.parser")
-    issues: List[Issue] = []
-    seq = 1
-
-    def add(title, severity, wcag, location, snippet, recommendation):
-        nonlocal seq
-        issues.append(
-            Issue(
-                id=f"{severity.upper()}-{seq:03d}",
-                title=title,
-                severity=severity,
-                wcag=wcag,
-                location=location,
-                snippet=snippet,
-                recommendation=(recommendation or "").strip(),
-            )
-        )
-        seq += 1
-
-    # 1) <html lang>
-    html_tag = soup.find("html")
-    if not html_tag or not html_tag.get("lang"):
-        add(
-            "Page language missing",
-            "medium",
-            "3.1.1",
-            "<html>",
-            "<html> tag missing a lang attribute.",
-            "Add a valid primary language code (e.g., <html lang='en-AU'>).",
-        )
-
-    # 2) <title>
-    t = soup.find("title")
-    if not t or not t.get_text(strip=True):
-        add(
-            "Page title missing or empty",
-            "high",
-            "2.4.2",
-            "<head><title>",
-            "Missing or empty <title> tag.",
-            "Provide a concise, descriptive page title (e.g., “Bin collection – Wyndham City Council”).",
-        )
-
-    # 3) Heading order (no jumps)
-    headings = [(h.name, h.get_text(strip=True)) for h in soup.find_all(re.compile("^h[1-6]$"))]
-    last = 0
-    for name, text_ in headings:
-        level = int(name[1])
-        if last and (level - last) > 1:
-            add(
-                "Heading level skipped",
-                "low",
-                "1.3.1",
-                f"<{name}>",
-                f"Found heading '{text_}' ({name}) after h{last}.",
-                "Don’t skip heading levels (e.g., use h2 after h1, not h3).",
-            )
-        last = level
-
-    # 4) Inputs without accessible label/name
-    inputs = soup.find_all(["input", "select", "textarea"])
-    for el in inputs:
-        # ignore hidden and non-data submit/button controls
-        if el.name == "input" and el.get("type") in ["hidden", "submit", "button", "image"]:
-            continue
-        if not label_targeted(soup, el):
-            add(
-                "Form control missing accessible label",
-                "high",
-                "3.3.2",
-                short(str(el), 300),
-                short(str(el), 160),
-                "Associate a visible <label for='id'> or add aria-label / aria-labelledby with meaningful text.",
-            )
-
-    # 5) Buttons/links without accessible name
-    actionable = soup.find_all(["button", "a"])
-    for el in actionable:
-        if el.name == "a" and not el.get("href"):
-            continue
-        if not has_accessible_name(el, soup):
-            add(
-                "Interactive element missing accessible name",
-                "high",
-                "4.1.2",
-                short(str(el), 300),
-                short(str(el), 160),
-                "Provide visible text, or set aria-label / aria-labelledby with a clear action name.",
-            )
-
-    # 6) Images without alt
-    for img in soup.find_all("img"):
-        if not img.get("alt"):
-            add(
-                "Image missing alt text",
-                "medium",
-                "1.1.1",
-                short(str(img), 300),
-                short(str(img), 160),
-                "Add descriptive alt text. Use empty alt (alt='') only for decorative images.",
-            )
-
-    # 7) Vague link text
-    vague = re.compile(r"^(click here|read more|more|learn more|here)$", re.I)
-    for a in soup.find_all("a"):
-        label = a.get_text(" ", strip=True)
-        if label and vague.match(label):
-            dest = a.get("href", "")
-            add(
-                "Ambiguous link text",
-                "low",
-                "2.4.4",
-                dest or short(str(a), 300),
-                f"Link text: “{label}”",
-                "Make link text specific to its destination (e.g., “Book hard waste collection”).",
-            )
-
-    # 8) Simple contrast check for inline styles (beta)
-    if check_contrast:
-        for el in soup.find_all(True):
-            style = el.get("style") or ""
-            if "color" in style and "background-color" in style:
-                mfg = re.search(r"color\s*:\s*([^;]+)", style, re.I)
-                mbg = re.search(r"background-color\s*:\s*([^;]+)", style, re.I)
-                if not (mfg and mbg):
-                    continue
-                fg = _parse_color(mfg.group(1))
-                bg = _parse_color(mbg.group(1))
-                if not fg or not bg:
-                    continue
-                ratio = _contrast_ratio(fg, bg)
-                if ratio < 4.5:
-                    add(
-                        "Low text contrast (inline styles)",
-                        "medium",
-                        "1.4.3",
-                        short(str(el), 300),
-                        f"Computed contrast ≈ {ratio:.2f}:1",
-                        "Increase contrast to ≥4.5:1 for normal text (≥3:1 for large text ≥18pt or 14pt bold).",
-                    )
-
-    # 9) PDF link warning (council-heavy)
-    if check_pdf_links:
-        pdf_links = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if ".pdf" in href.lower():
-                text = a.get_text(" ", strip=True)
-                pdf_links.append((href, text))
-        if pdf_links:
-            add(
-                "PDFs linked on page",
-                "low",
-                "1.1.1 / 1.3.1",
-                url,
-                f"Found {len(pdf_links)} PDF link(s).",
-                "Provide an accessible HTML equivalent or ensure the PDF is tagged and WCAG-compliant.",
-            )
-
-    # 10) Footer accessibility link presence
-    if check_footer_access_link:
-        footer = soup.find("footer")
-        has_access_link = False
-        pattern = re.compile(r"accessibility|accessibility statement|report an accessibility issue", re.I)
-        search_scope = footer or soup
-        for a in search_scope.find_all("a"):
-            if pattern.search(a.get_text(" ", strip=True)) or (a.get("href") and pattern.search(a["href"])):
-                has_access_link = True
-                break
-        if not has_access_link:
-            add(
-                "No visible Accessibility link",
-                "low",
-                "2.4.5",
-                "<footer>",
-                "Could not find an Accessibility/Accessibility Statement link in footer or page.",
-                "Add a visible link to the Accessibility page and a short form for reporting accessibility issues.",
-            )
-
-    # 11) Keyboard: taboo tabindex values
-    if check_tabindex:
-        for el in soup.find_all(True):
-            if el.has_attr("tabindex") and str(el["tabindex"]).strip() == "-1":
-                # If it's interactive, warn
-                if el.name in ("a", "button", "input", "select", "textarea") or el.get("role") in ("button", "link"):
-                    add(
-                        "Interactive element removed from tab order",
-                        "medium",
-                        "2.1.1",
-                        short(str(el), 300),
-                        short(str(el), 160),
-                        "Avoid tabindex='-1' on interactive controls needed by keyboard users.",
-                    )
-
-    # Council-specific nudge
-    if council and "Wyndham" in council:
-        add(
-            "Wyndham: add ‘Report an accessibility issue’ link",
-            "low",
-            "2.4.5",
-            url,
-            "Council pages should expose a clear feedback / report link.",
-            "Add a footer link to the Accessibility page and a short form for reporting accessibility problems.",
-        )
-
-    return issues
+# =====================
+# PDF Accessibility scan
+# =====================
+@dataclass
+class PdfAccessibility:
+    url: str
+    pages: int
+    is_tagged: bool
+    image_count: int
+    alt_text_count: int
+    notes: str
 
 
-# ---------- UI bits ----------
-def header_wyndham():
-    st.markdown(
-        f"""
-        <div style="display:flex;align-items:center;gap:14px;margin:8px 0 22px 0">
-            <img src="{WYNDHAM['logo']}" alt="Wyndham" height="40"/>
-            <div style="font-size:22px;font-weight:700">{APP_NAME}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def analyze_pdf(url: str) -> PdfAccessibility:
+    # Download to bytes
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    bio = io.BytesIO(r.content)
+    reader = PdfReader(bio)
+
+    # Heuristics:
+    # - Tagged PDF usually has /StructTreeRoot in catalog
+    root = reader.trailer.get("/Root", {})
+    is_tagged = bool(root.get("/StructTreeRoot"))
+
+    pages = len(reader.pages)
+
+    # Count images & look for any /Alt occurrences by scanning raw XObject names
+    image_count = 0
+    alt_text_count = 0
+
+    try:
+        for i in range(pages):
+            page = reader.pages[i]
+            resources = page.get("/Resources") or {}
+            xobj = resources.get("/XObject") or {}
+            if hasattr(xobj, "items"):
+                for name, obj in xobj.items():
+                    try:
+                        subtype = obj.get("/Subtype")
+                        if subtype and subtype == "/Image":
+                            image_count += 1
+                            # Alt text is typically in structure tree, not directly here; as a heuristic, count none here.
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # Heuristic search of raw bytes for "/Alt" keys (very rough)
+    try:
+        raw = r.content.decode("latin-1", errors="ignore")
+        alt_text_count = raw.count("/Alt(") + raw.count("/Alt ")
+    except Exception:
+        alt_text_count = 0
+
+    notes = "Tagged PDF" if is_tagged else "PDF appears untagged (no /StructTreeRoot)"
+
+    return PdfAccessibility(url=url, pages=pages, is_tagged=is_tagged, image_count=image_count, alt_text_count=alt_text_count, notes=notes)
+
+
+# =====================
+# Fix Suggestions
+# =====================
+
+def suggest_fix_for_contrast(issue: Dict) -> str:
+    # Increase contrast by darkening text or lightening background. Simple suggestion:
+    return (
+        f"For element `{issue['tag']}` with ratio {issue['ratio']}:\n"
+        f"- If text is too light, try a darker color (e.g., color: #111111).\n"
+        f"- If background is too dark, lighten it (e.g., background-color: #FFFFFF).\n"
+        f"- Example CSS: `{issue['tag']} {{ color: #111111; }}`\n"
     )
 
 
-def stat_chip(label: str, value: int):
-    st.markdown(
-        f"""
-        <div style="
-            border-radius:14px;padding:10px 14px;border:1px solid #e8e8e8;
-            background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.04);text-align:center">
-            <div style="font-size:12px;color:#555">{label}</div>
-            <div style="font-size:22px;font-weight:700">{value}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def suggest_fix_for_img_alt(img_issue: Dict) -> str:
+    return (
+        f"Image `{img_issue['src']}` is missing alt text. Add a meaningful description, e.g.:\n"
+        f"`<img src=\"{img_issue['src']}\" alt=\"Wyndham City Council logo\">`"
     )
 
 
-def make_downloads(df: pd.DataFrame, page_url: str):
-    csv = df.to_csv(index=False)
-    js = df.to_json(orient="records", indent=2)
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        st.download_button("Download CSV", data=csv, file_name="accessibility_report.csv", mime="text/csv")
-    with c2:
-        st.download_button("Download JSON", data=js, file_name="accessibility_report.json", mime="application/json")
-    with c3:
-        st.code(
-            f'# Paste into your bug ticket\nURL = "{page_url}"\nissues = {json.dumps(json.loads(js)[:2], indent=2)}\n# (truncated preview)',
-            language="python",
-        )
+# =====================
+# Report (PDF) builder
+# =====================
+
+def build_pdf_report(path: str, brand: Dict, target_url: str, html_result: Optional[Dict], pdf_results: List[PdfAccessibility]):
+    doc = SimpleDocTemplate(path, pagesize=A4, leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
+    styles = getSampleStyleSheet()
+    styles["Normal"].fontName = "Helvetica"
+    styles["Heading1"].alignment = TA_LEFT
+    story = []
+
+    # Header with logo
+    try:
+        logo_img = ImageReader(requests.get(brand["logo"], timeout=10).content)
+        story.append(utils.Image(logo_img, width=120, height=30))
+    except Exception:
+        story.append(Paragraph(f"<b>{brand['name']}</b>", styles["Heading1"]))
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("<b>Accessibility Audit Report</b>", styles["Heading1"]))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(f"Target URL: {target_url}", styles["Normal"]))
+    story.append(Paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    if html_result:
+        story.append(Paragraph("<b>WCAG 1.4.3 Color Contrast (HTML)</b>", styles["Heading2"]))
+        summary = [["Checked elements", html_result["checked"]],
+                   ["Passed", html_result["pass_count"]],
+                   ["Score (%)", html_result["score"]]]
+        t = Table(summary, colWidths=[140, 340])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor(brand["primary"])),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
+            ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
+        ]))
+        story.append(t)
+        story.append(Spacer(1, 8))
+
+        if html_result["contrast_issues"]:
+            story.append(Paragraph("<b>Contrast Issues (examples)</b>", styles["Heading3"]))
+            rows = [["Tag", "Text (truncated)", "FG", "BG", "Ratio"]]
+            for i in html_result["contrast_issues"][:12]:
+                rows.append([i["tag"], i["text"][:60], i["fg"], i["bg"], i["ratio"]])
+            tt = Table(rows, colWidths=[50, 250, 60, 60, 60])
+            tt.setStyle(TableStyle([
+                ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
+                ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
+            ]))
+            story.append(tt)
+            story.append(Spacer(1, 8))
+
+        if html_result["img_alt_issues"]:
+            story.append(Paragraph("<b>Images Missing Alt Text (examples)</b>", styles["Heading3"]))
+            rows = [["Image src"]]
+            for i in html_result["img_alt_issues"][:12]:
+                rows.append([i["src"]])
+            tt = Table(rows, colWidths=[480])
+            tt.setStyle(TableStyle([
+                ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
+                ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
+            ]))
+            story.append(tt)
+            story.append(Spacer(1, 12))
+
+    if pdf_results:
+        story.append(Paragraph("<b>PDF Accessibility (WCAG-related)</b>", styles["Heading2"]))
+        rows = [["PDF URL", "Pages", "Tagged?", "Images", "Alt texts (heuristic)", "Notes"]]
+        for r in pdf_results[:10]:
+            rows.append([r.url, r.pages, "Yes" if r.is_tagged else "No", r.image_count, r.alt_text_count, r.notes])
+        t = Table(rows, colWidths=[180, 40, 50, 50, 70, 120])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor(brand["primary"])),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('INNERGRID', (0,0), (-1,-1), 0.25, colors.grey),
+            ('BOX', (0,0), (-1,-1), 0.25, colors.grey)
+        ]))
+        story.append(t)
+
+    doc.build(story)
 
 
-# ---------- App ----------
-def main():
-    header_wyndham()
+# =====================
+# Persistence for dashboard
+# =====================
 
-    left, right = st.columns([1.2, 1], vertical_alignment="center")
-
-    with left:
-        st.write("Quickly spot WCAG issues on a single page. For compliance, follow up with a full WCAG 2.x evaluation.")
-        url = st.text_input("Page URL", value=WYNDHAM["links"]["Hard waste"], placeholder="https://…")
-        do_contrast = st.checkbox("Run color contrast check (beta)", value=False)
-        analyze_btn = st.button("Analyze URL", type="primary")
-
-    with right:
-        st.write("**Wyndham shortcuts**")
-        col1, col2 = st.columns(2)
-        for i, link in enumerate(WYNDHAM["quick_targets"]):
-            (col1 if i % 2 == 0 else col2).markdown(f"- [{link.split('/')[3].title()}]({link})")
-        st.caption(f"[Accessibility statement]({WYNDHAM['links']['Accessibility statement']})")
-
-    st.divider()
-
-    if analyze_btn and url.strip():
+def append_audit_row(row: Dict):
+    df = None
+    if os.path.exists(AUDITS_CSV):
         try:
-            with st.spinner("Fetching & analyzing…"):
-                final_url, html = fetch(url.strip())
-                iss = analyze(
-                    html,
-                    final_url,
-                    council=WYNDHAM["name"],
-                    check_contrast=do_contrast,
-                    check_footer_access_link=True,
-                    check_pdf_links=True,
-                    check_tabindex=True,
-                )
-                df = issues_df(iss)
-                cnt = counts(df)
+            df = pd.read_csv(AUDITS_CSV)
+        except Exception:
+            df = None
+    if df is None:
+        df = pd.DataFrame(columns=["timestamp", "url", "html_score", "contrast_issues", "img_alt_issues", "pdfs_scanned", "pdfs_tagged"])
+    df.loc[len(df)] = row
+    df.to_csv(AUDITS_CSV, index=False)
 
-            a, b, c, d = st.columns([1, 1, 1, 6])
-            with a:
-                stat_chip("Total issues", len(df))
-            with b:
-                stat_chip("High", cnt["high"])
-            with c:
-                stat_chip("Medium", cnt["medium"])
-            with d:
-                stat_chip("Low", cnt["low"])
 
-            st.subheader("Results")
-            if df.empty:
-                st.success("No issues found in these heuristics. Run a full manual + assistive tech evaluation to confirm.")
-            else:
-                show_cols = ["id", "title", "severity", "wcag", "location", "snippet"]
-                grid = df[show_cols].rename(
-                    columns={
-                        "id": "ID",
-                        "title": "Title",
-                        "severity": "Severity",
-                        "wcag": "WCAG",
-                        "location": "Location",
-                        "snippet": "Snippet",
-                    }
-                )
-                st.dataframe(grid, use_container_width=True, hide_index=True)
+def load_audits() -> pd.DataFrame:
+    if os.path.exists(AUDITS_CSV):
+        try:
+            return pd.read_csv(AUDITS_CSV)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["timestamp", "url", "html_score", "contrast_issues", "img_alt_issues", "pdfs_scanned", "pdfs_tagged"])
 
-                st.subheader("Details")
-                for _, row in df.iterrows():
-                    with st.expander(f"[{row['severity'].upper()}] {row['title']} — {row['id']}"):
-                        st.markdown(f"**Location:** `{short(row['location'], 300)}`")
-                        st.markdown(f"**WCAG:** {row['wcag']}")
-                        st.markdown("**Snippet:**")
-                        st.code(row["snippet"], language="html")
-                        st.markdown("**Recommendations:**")
-                        st.write(row["recommendation"])
 
-                st.subheader("Export")
-                make_downloads(df, final_url)
+# =====================
+# UI
+# =====================
 
-            st.divider()
-            st.caption(
-                "This is a heuristic scanner. For compliance, conduct a full WCAG 2.x evaluation with manual testing, keyboard checks, and assistive technologies."
-            )
+primary = WYNDHAM["primary"]
+
+st.markdown(
+    f"""
+    <style>
+    .wyndham-header {{
+        display:flex; align-items:center; gap:12px; padding:10px 0 6px 0;
+        border-bottom: 3px solid {primary}20;
+    }}
+    .wyndham-badge {{
+        background:{primary}; color:white; padding:2px 8px; border-radius:999px; font-size:12px;
+    }}
+    .small-muted {{ color:#6b7280; font-size:12px; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+col_logo, col_title = st.columns([1,4])
+with col_logo:
+    try:
+        st.image(WYNDHAM["logo"], width=160)
+    except Exception:
+        st.write("**Wyndham City Council**")
+with col_title:
+    st.markdown("<div class='wyndham-header'><h2>Accessibility Auditor — WCAG 2.2 AA</h2> <span class='wyndham-badge'>Wyndham-specialized</span></div>", unsafe_allow_html=True)
+    st.caption("Quick-check color contrast, image alts, and PDF tagging. Generate branded reports and track improvements over time.")
+
+# Input
+with st.sidebar:
+    st.markdown("### Scan Settings")
+    target_url = st.text_input("Page URL to scan (HTML)", value=WYNDHAM["links"]["Home"])
+    st.markdown("**Optional: PDF URLs (one per line)**")
+    pdf_urls_text = st.text_area("PDF URLs", height=120, placeholder="https://.../report.pdf\nhttps://.../policy.pdf")
+    st.markdown("---")
+    st.markdown("**Quick Links**")
+    for label, link in WYNDHAM["links"].items():
+        st.markdown(f"- [{label}]({link})")
+
+col1, col2 = st.columns([2,1])
+
+with col1:
+    st.subheader("1) Run Audit")
+    run_html = st.button("Scan HTML (Contrast & Alts)")
+    run_pdfs = st.button("Scan PDFs (Tagging & Alts)")
+
+    html_result = st.session_state.get("html_result")
+    pdf_results: List[PdfAccessibility] = st.session_state.get("pdf_results", [])
+
+    if run_html and target_url:
+        try:
+            with st.spinner("Scanning HTML for contrast and alt text issues..."):
+                html_result = analyze_html(target_url)
+                st.session_state["html_result"] = html_result
         except Exception as e:
-            st.error(f"Failed to analyze: {e}")
+            st.error(f"HTML scan failed: {e}")
 
-    with st.sidebar:
-        st.markdown("### Council")
-        st.write(f"Auditing: **{WYNDHAM['name']}**")
-        st.color_picker("Theme (primary)", WYNDHAM["primary"], key="theme_color", help="Visual only")
-        st.markdown("---")
-        st.markdown("### Tips")
-        st.markdown(
-            """
-- Start with **transactional pages** (forms, payments, bin bookings).
-- Fix **High** first: titles, form labels, button names.
-- Prefer **explicit labels** over placeholders.
-- Avoid “click here”; make links descriptive.
-- Provide an **Accessibility contact** on every page.
-"""
-        )
+    if run_pdfs:
+        pdf_results = []
+        for line in (pdf_urls_text or "").splitlines():
+            u = line.strip()
+            if not u:
+                continue
+            try:
+                with st.spinner(f"Analyzing PDF: {u}"):
+                    pdf_results.append(analyze_pdf(u))
+            except Exception as e:
+                st.warning(f"Failed PDF: {u} — {e}")
+        st.session_state["pdf_results"] = pdf_results
 
+    # Show results
+    if html_result:
+        st.markdown("### HTML — WCAG 1.4.3 Color Contrast")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Score (%)", html_result["score"])
+        m2.metric("Checked", html_result["checked"])
+        m3.metric("Passed", html_result["pass_count"])
+        m4.metric("Alt issues", len(html_result["img_alt_issues"]))
 
-if __name__ == "__main__":
-    main()
+        with st.expander("Contrast fails (examples)"):
+            if html_result["contrast_issues"]:
+                df_ci = pd.DataFrame(html_result["contrast_issues"])
+                st.dataframe(df_ci)
+                st.info("Fix suggestions are listed below.")
+            else:
+                st.success("No contrast issues found in inline-styled elements scanned.")
+
+        with st.expander("Images missing alt text"):
+            if html_result["img_alt_issues"]:
+                df_ai = pd.DataFrame(html_result["img_alt_issues"])
+                st.dataframe(df_ai)
+            else:
+                st.success("No images without alt text detected in this page.")
+
+        st.markdown("### HTML — Auto Fix Suggestions")
+        if html_result["contrast_issues"]:
+            for issue in html_result["contrast_issues"][:10]:
+                st.code(suggest_fix_for_contrast(issue))
+        if html_result["img_alt_issues"]:
+            for issue in html_result["img_alt_issues"][:5]:
+                st.code(suggest_fix_for_img_alt(issue))
+
+    if pdf_results:
+        st.markdown("### PDF Accessibility Summary")
+        df_pdf = pd.DataFrame([asdict(r) for r in pdf_results])
+        st.dataframe(df_pdf)
+
+    if (html_result or pdf_results):
+        # Append to dashboard history
+        if st.button("Save to Dashboard History"):
+            row = {
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "url": target_url or "",
+                "html_score": html_result["score"] if html_result else None,
+                "contrast_issues": len(html_result["contrast_issues"]) if html_result else 0,
+                "img_alt_issues": len(html_result["img_alt_issues"]) if html_result else 0,
+                "pdfs_scanned": len(pdf_results),
+                "pdfs_tagged": sum(1 for p in pdf_results if p.is_tagged)
+            }
+            append_audit_row(row)
+            st.success("Saved! View trends in the Dashboard panel →")
+
+with col2:
+    st.subheader("2) Export Report")
+    if st.button("Generate PDF Report (Wyndham-branded)"):
+        html_result = st.session_state.get("html_result")
+        pdf_results = st.session_state.get("pdf_results", [])
+        if not (html_result or pdf_results):
+            st.warning("Run a scan first.")
+        else:
+            out_path = os.path.join(DATA_DIR, f"audit_{int(time.time())}.pdf")
+            try:
+                build_pdf_report(out_path, WYNDHAM, target_url or "(none)", html_result, pdf_results)
+                with open(out_path, "rb") as f:
+                    st.download_button("Download Report PDF", data=f.read(), file_name=os.path.basename(out_path), mime="application/pdf")
+            except Exception as e:
+                st.error(f"Report failed: {e}")
+
+st.markdown("---")
+
+# =====================
+# Dashboard — track over time
+# =====================
+st.subheader("Dashboard — Improvements Over Time")
+
+df_hist = load_audits()
+if df_hist.empty:
+    st.info("No history yet. Run a scan and click 'Save to Dashboard History'.")
+else:
+    # Convert timestamp
+    try:
+        df_hist["timestamp"] = pd.to_datetime(df_hist["timestamp"])  # type: ignore
+    except Exception:
+        pass
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**HTML Score (%)**")
+        st.line_chart(df_hist.set_index("timestamp")["html_score"].fillna(method="ffill"))
+    with c2:
+        st.markdown("**Contrast Issues (count)**")
+        st.line_chart(df_hist.set_index("timestamp")["contrast_issues"].fillna(0))
+
+    st.markdown("**Recent Audits**")
+    st.dataframe(df_hist.sort_values("timestamp", ascending=False).head(20))
+
+st.caption("Note: HTML contrast analysis is based on inline styles only (quick-check). Full WCAG audit requires computed styles and keyboard/ARIA tests.")
