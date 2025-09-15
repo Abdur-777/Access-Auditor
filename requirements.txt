@@ -1,7 +1,11 @@
-streamlit
-requests
-beautifulsoup4
-pandas
-pypdf
-reportlab
-fpdf2
+# --- Core app ---
+streamlit==1.32.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+pandas==2.2.2
+
+# --- PDF export ---
+reportlab==4.2.2
+
+# --- Recommended (images & fast parsing) ---
+Pillow==10.4.0
