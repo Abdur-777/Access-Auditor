@@ -1,18 +1,20 @@
 # app.py — Accessibility Auditor (WCAG quick-check) with Wyndham styling
-# Run: streamlit run app.py
-# Requires: streamlit, requests, beautifulsoup4, reportlab
-# Optional for computed-style contrast: playwright (and install Chromium)
+# Run locally:  streamlit run app.py
+# Start command (Render/etc):  streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
+# Requirements: streamlit, requests, beautifulsoup4, reportlab, pandas
+# Optional (for computed-style contrast): playwright  (and install Chromium)
 
 import os
-import re, time, math
+import re
 from datetime import datetime
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 from typing import List, Dict, Tuple, Optional
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 import streamlit as st
 import ipaddress
+import pandas as pd
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Streamlit must configure page FIRST
@@ -228,7 +230,6 @@ def looks_like_filename(s: str) -> bool:
         return False
     if re.search(r"\.(png|jpe?g|gif|svg|webp)$", s, re.I):
         return True
-    # no spaces, lots of separators → probably a filename-ish token
     return bool(re.search(r"[a-z0-9_-]", s) and " " not in s)
 
 def suggest_alt(src: str, width: Optional[int] = None, height: Optional[int] = None, site_name: str = "") -> Tuple[str, str]:
@@ -237,7 +238,6 @@ def suggest_alt(src: str, width: Optional[int] = None, height: Optional[int] = N
     fname = path.split("/")[-1] if path else ""
     stem = re.sub(r"\.(png|jpg|jpeg|gif|svg|webp)$", "", fname, flags=re.I)
     tiny = (width and width < 24) or (height and height < 24)
-
     if tiny or DECORATIVE_HINTS.search(stem or ""):
         return ("", "decorative")
     if re.search(r"logo", stem or "", re.I):
@@ -444,6 +444,7 @@ st.markdown("""
 <div class="wy-accents">
   <h1>Accessibility Auditor — WCAG 2.2 AA <span class="wy-pill">Wyndham</span></h1>
   <p>Quick-check contrast (inline styles), image alts, and export a Wyndham-branded PDF. Use the Test Panel for reliable demo pages.</p>
+  <p><small><b>Scope:</b> Inline contrast by default; optional computed-style contrast; alt issues with suggestions and CSV/PDF export. Not a full WCAG audit.</small></p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -479,7 +480,7 @@ with st.sidebar:
         if st.button("Reset form"):
             for k in ("url_input", "latest_run"):
                 st.session_state.pop(k, None)
-            st.experimental_rerun()
+            st.rerun()
 
 # Session history store
 if "history" not in st.session_state:
@@ -498,7 +499,7 @@ latest_run = st.session_state.get("latest_run")
 
 # ======== HTML scan ========
 if scan_html_clicked:
-    if use_pasted and pasted_html.strip():
+    if use_pasted and 'pasted_html' in locals() and pasted_html.strip():
         html = pasted_html
         url_for_report = url_input or "(pasted HTML)"
         ok = True; err_msg = ""
@@ -519,4 +520,190 @@ if scan_html_clicked:
     if not ok:
         st.error(f"HTML scan failed: {err_msg}")
     else:
-        with
+        with st.spinner("Analyzing HTML…"):
+            # Inline quick-check
+            report = analyze_html(
+                html,
+                assume_bg=(255, 255, 255),
+                site_name=ORG_NAME,
+                level=wcag_level,
+            )
+
+            # Optional: computed-style contrast (headless)
+            if use_computed and is_public_http_url(url_for_report):
+                comp = analyze_computed_contrast(url_for_report, level=wcag_level)
+                if comp and not comp.get("error"):
+                    report["contrast_checked"] = int(comp.get("checked", report["contrast_checked"]))
+                    report["contrast_failed"] = int(comp.get("failed", report["contrast_failed"]))
+                    report["contrast_examples"] = comp.get("examples", report.get("contrast_examples") or []) or []
+                else:
+                    msg = comp.get("error", "unknown error") if isinstance(comp, dict) else "unavailable"
+                    st.warning(f"Computed-style contrast unavailable: {msg}. Showing inline-only results.")
+
+            scores = compute_scores(
+                report["contrast_checked"],
+                report["contrast_failed"],
+                len(report["alt_issues"]),
+            )
+
+            latest_run = {
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "url": url_for_report,
+                "scores": scores,
+                "contrast_checked": report["contrast_checked"],
+                "contrast_failed": report["contrast_failed"],
+                "alt_issues": report["alt_issues"],
+                "contrast_examples": report["contrast_examples"],
+            }
+            st.session_state["latest_run"] = latest_run
+
+            # Auto-save if enabled
+            if st.session_state.get("auto_save", False):
+                st.session_state["history"].append(
+                    {
+                        "timestamp": latest_run["timestamp"],
+                        "url": latest_run["url"],
+                        "contrast_score": latest_run["scores"]["contrast_score"],
+                        "overall_score": latest_run["scores"]["overall_score"],
+                        "contrast_checked": latest_run["contrast_checked"],
+                        "contrast_failed": latest_run["contrast_failed"],
+                        "alt_issues": len(latest_run["alt_issues"]),
+                    }
+                )
+                st.success("Saved automatically to Dashboard.")
+
+# ======== Export PDF ========
+if export_pdf_clicked:
+    run = st.session_state.get("latest_run")
+    if not run:
+        st.warning("Run an HTML scan first.")
+    else:
+        path = "audit_report.pdf"
+        export_pdf_wyndham(
+            path,
+            url=run["url"],
+            scores=run["scores"],
+            contrast_checked=run["contrast_checked"],
+            contrast_failed=run["contrast_failed"],
+            alt_issues=run["alt_issues"],
+        )
+        with open(path, "rb") as f:
+            st.download_button("Download PDF report", f, file_name="audit_report.pdf")
+
+# ======== Show results (if any) ========
+if latest_run:
+    with results_box:
+        st.subheader("Results")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Contrast Score (%)", latest_run["scores"]["contrast_score"])
+        m2.metric("Overall Score", latest_run["scores"]["overall_score"])
+        m3.metric("Alt issues", len(latest_run["alt_issues"]))
+
+        # CSV downloads (Alt-only and Overall issues)
+        try:
+            # Alt issues CSV
+            if latest_run.get("alt_issues"):
+                alt_df = pd.DataFrame(latest_run["alt_issues"])
+                st.download_button(
+                    "Download CSV (Alt issues)",
+                    data=alt_df.to_csv(index=False).encode("utf-8"),
+                    file_name="alt_issues.csv",
+                    mime="text/csv",
+                )
+
+            # Overall Issues CSV (contrast + alts)
+            overall_rows = []
+            for ex in latest_run.get("contrast_examples", [])[:200]:
+                overall_rows.append({
+                    "type": "contrast",
+                    "tag": ex.get("tag", ""),
+                    "text": ex.get("text", ""),
+                    "ratio": ex.get("ratio", ""),
+                    "src": "",
+                    "suggested_alt": "",
+                    "classification": ""
+                })
+            for it in latest_run.get("alt_issues", []):
+                overall_rows.append({
+                    "type": "alt",
+                    "tag": "img",
+                    "text": "",
+                    "ratio": "",
+                    "src": it.get("src", ""),
+                    "suggested_alt": it.get("suggested_alt", ""),
+                    "classification": it.get("classification", "")
+                })
+            if overall_rows:
+                overall_df = pd.DataFrame(overall_rows)
+                st.download_button(
+                    "Download CSV (Overall issues)",
+                    data=overall_df.to_csv(index=False).encode("utf-8"),
+                    file_name="overall_issues.csv",
+                    mime="text/csv",
+                )
+        except Exception as e:
+            st.info(f"CSV export unavailable: {e}")
+
+        with st.expander("Contrast fails (examples)"):
+            if latest_run["contrast_failed"] == 0:
+                st.write("No contrast failures found for the selected WCAG threshold.")
+            else:
+                st.write("Examples that failed the selected WCAG threshold:")
+                for ex in latest_run.get("contrast_examples", [])[:10]:
+                    st.write(f"• <{ex.get('tag','?')}> ratio {ex.get('ratio','?')}: {ex.get('text','')} ")
+
+        with st.expander("Images missing or weak alt text"):
+            if not latest_run["alt_issues"]:
+                st.write("No missing/weak alt text detected.")
+            else:
+                for item in latest_run["alt_issues"]:
+                    st.markdown(f"- `{item['src']}` → **{item['suggested_alt'] or '(decorative)'}** *({item['classification']})*")
+
+        st.subheader("Auto Fix Suggestions")
+        if not latest_run["alt_issues"]:
+            st.write("No suggestions. Nice!")
+        else:
+            for issue in latest_run["alt_issues"][:20]:
+                if issue["classification"] == "decorative":
+                    suggestion = f"Add alt text: `<img src='{issue['src']}' alt='' aria-hidden='true'>`"
+                else:
+                    suggestion = f"Add alt text: `<img src='{issue['src']}' alt='{issue['suggested_alt']}'>`"
+                st.code(suggestion, language="html")
+
+        # Save run
+        if st.button("Save this run to Dashboard"):
+            st.session_state["history"].append(
+                {
+                    "timestamp": latest_run["timestamp"],
+                    "url": latest_run["url"],
+                    "contrast_score": latest_run["scores"]["contrast_score"],
+                    "overall_score": latest_run["scores"]["overall_score"],
+                    "contrast_checked": latest_run["contrast_checked"],
+                    "contrast_failed": latest_run["contrast_failed"],
+                    "alt_issues": len(latest_run["alt_issues"]),
+                }
+            )
+            st.success("Saved. See Dashboard below.")
+
+# ======== Dashboard ========
+st.subheader("Dashboard")
+hist = st.session_state.get("history", [])
+if not hist:
+    st.info("No history yet. Run a scan and Save.")
+else:
+    try:
+        df = pd.DataFrame(hist)
+        st.dataframe(df, use_container_width=True)
+        st.download_button(
+            "Download Dashboard CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="audit_history.csv",
+            mime="text/csv",
+        )
+    except Exception:
+        st.write(hist)
+
+st.caption(
+    "Notes: Inline contrast by default. Enable 'Use computed-style contrast' to include CSS-based colors and correct large-text thresholds. "
+    "This is a quick check; full WCAG audits also cover keyboard navigation, focus order, landmarks, ARIA roles/states, forms, and media alternatives."
+)
