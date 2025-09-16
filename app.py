@@ -1,25 +1,24 @@
-# app.py — Accessibility Auditor (Quick Accessibility Check) — Wyndham Blue
+# app.py — Accessibility Auditor (WCAG quick‑check) with Wyndham styling
 # Run: streamlit run app.py
+# Required in requirements.txt: streamlit, requests, beautifulsoup4, reportlab
 
-import re
+import re, time, math
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from typing import List, Dict, Tuple, Optional
 
 import requests
-from bs4 import BeautifulSoup
-import pandas as pd
+from bs4 import BeautifulSoup, Tag
 import streamlit as st
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Streamlit setup (must be the FIRST Streamlit call)
-# ──────────────────────────────────────────────────────────────────────────────
+# Must be the first Streamlit call in the script
 st.set_page_config(page_title="Accessibility Auditor — WCAG 2.2 AA", layout="wide")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # Branding / Styling (Wyndham blue, no logo)
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 WYNDHAM_BLUE = "#003B73"
+
 
 def inject_brand_css():
     st.markdown(
@@ -35,24 +34,24 @@ def inject_brand_css():
             display:inline-block; background: rgba(0,59,115,.08); color: var(--wyndham);
             padding:2px 10px; border-radius:999px; font-weight:600; font-size:12px;
           }}
+          /* tidy up expanders */
           details>summary {{font-weight:600;}}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-inject_brand_css()
 
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 # Fetch helpers (browser-like headers + cache)
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/127.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
 }
+
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_html(url: str, timeout: int = 20) -> str:
@@ -60,81 +59,46 @@ def fetch_html(url: str, timeout: int = 20) -> str:
     r.raise_for_status()
     return r.text
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional: computed-style contrast via Playwright (headless Chromium)
-# Returns dict: {"checked":int, "failed":int, "examples":[{tag,text,ratio}]} or {"error": "..."}
-# ──────────────────────────────────────────────────────────────────────────────
-def analyze_computed_contrast(url: str, timeout_ms: int = 30000):
-    try:
-        from playwright.sync_api import sync_playwright  # type: ignore
-    except Exception as e:
-        return {"error": f"Playwright not available: {e}"}
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+# =========================
+# Contrast math (inline-only)
+# =========================
 
-            js = """
-            () => {
-              const results = [];
-              const els = Array.from(document.querySelectorAll('*')).filter(el => {
-                const s = getComputedStyle(el);
-                return s && s.color && s.visibility !== 'hidden' && s.display !== 'none' &&
-                       (el.textContent||'').trim().length>0;
-              });
-              function parse(col){
-                const ctx = document.createElement('canvas').getContext('2d');
-                ctx.fillStyle = col; // normalize to rgb(...)
-                const m = ctx.fillStyle.match(/[0-9]+/g); if(!m) return [0,0,0];
-                return m.slice(0,3).map(Number);
-              }
-              function lum(rgb){
-                const [r,g,b] = rgb.map(v=>v/255);
-                const a=[r,g,b].map(v=> v<=0.03928 ? v/12.92 : Math.pow((v+0.055)/1.055,2.4));
-                return 0.2126*a[0]+0.7152*a[1]+0.0722*a[2];
-              }
-              function ratio(f,b){ const L1=Math.max(f,b), L2=Math.min(f,b); return (L1+0.05)/(L2+0.05); }
-              function effectiveBg(el){
-                let cur = el;
-                while(cur){
-                  const s = getComputedStyle(cur);
-                  if(s.backgroundColor && s.backgroundColor !== 'rgba(0, 0, 0, 0)') return s.backgroundColor;
-                  cur = cur.parentElement;
-                }
-                return 'rgb(255,255,255)';
-              }
-              let failed = 0;
-              for(const el of els){
-                const s = getComputedStyle(el);
-                const fg = parse(s.color);
-                const bg = parse(effectiveBg(el));
-                const cr = ratio(lum(fg), lum(bg));
-                if(cr < 4.5){
-                  failed++;
-                  if(results.length < 50){
-                    results.push({tag: el.tagName.toLowerCase(),
-                                  text: (el.textContent||'').trim().slice(0,80),
-                                  ratio: Math.round(cr*100)/100});
-                  }
-                }
-              }
-              return {checked: els.length, failed, examples: results};
-            }
-            """
-            data = page.evaluate(js)
-            browser.close()
-            return data
-    except Exception as e:
-        return {"error": str(e)}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Color parsing & contrast (inline styles)
-# ──────────────────────────────────────────────────────────────────────────────
 HEX_RE = re.compile(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})")
 RGB_RE = re.compile(r"rgb\((\d+),\s*(\d+),\s*(\d+)\)")
 RGBA_RE = re.compile(r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*(0|0?\.\d+|1)\)")
+
+# Parse dimensions like "10", "10px", "1.5rem" → 10 (approx px); return None if not parsable.
+def parse_dimension(val) -> Optional[int]:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return int(float(val))
+    s = str(val).strip()
+    num = []
+    dot = False
+    sign_allowed = True
+    for ch in s:
+        if ch.isdigit():
+            num.append(ch)
+            sign_allowed = False
+        elif ch == '.' and not dot:
+            num.append(ch)
+            dot = True
+            sign_allowed = False
+        elif ch in '+-' and sign_allowed:
+            if ch == '-':
+                num.append(ch)
+            sign_allowed = False
+        elif num:
+            break
+    try:
+        n = ''.join(num)
+        return int(float(n)) if n else None
+    except Exception:
+        return None
+
+
 
 def parse_color(value: str) -> Optional[Tuple[int, int, int]]:
     if not value:
@@ -144,9 +108,13 @@ def parse_color(value: str) -> Optional[Tuple[int, int, int]]:
     if m:
         s = m.group(1)
         if len(s) == 3:
-            r = int(s[0] * 2, 16); g = int(s[1] * 2, 16); b = int(s[2] * 2, 16)
+            r = int(s[0] * 2, 16)
+            g = int(s[1] * 2, 16)
+            b = int(s[2] * 2, 16)
         else:
-            r = int(s[0:2], 16); g = int(s[2:4], 16); b = int(s[4:6], 16)
+            r = int(s[0:2], 16)
+            g = int(s[2:4], 16)
+            b = int(s[4:6], 16)
         return (r, g, b)
     m = RGB_RE.search(value)
     if m:
@@ -154,11 +122,20 @@ def parse_color(value: str) -> Optional[Tuple[int, int, int]]:
     m = RGBA_RE.search(value)
     if m:
         r, g, b, a = int(m.group(1)), int(m.group(2)), int(m.group(3)), float(m.group(4))
+        # If fully transparent, treat as None
         if a == 0:
             return None
         return (r, g, b)
-    NAMED = {"black": (0,0,0), "white": (255,255,255), "gray": (128,128,128), "grey": (128,128,128), "red": (255,0,0)}
+    # Named colors (very small subset)
+    NAMED = {
+        "black": (0, 0, 0),
+        "white": (255, 255, 255),
+        "gray": (128, 128, 128),
+        "grey": (128, 128, 128),
+        "red": (255, 0, 0),
+    }
     return NAMED.get(value.lower())
+
 
 def rel_luminance(rgb: Tuple[int, int, int]) -> float:
     def _lin(c):
@@ -168,22 +145,28 @@ def rel_luminance(rgb: Tuple[int, int, int]) -> float:
     R, G, B = _lin(r), _lin(g), _lin(b)
     return 0.2126 * R + 0.7152 * G + 0.0722 * B
 
+
 def contrast_ratio(c1: Tuple[int, int, int], c2: Tuple[int, int, int]) -> float:
-    L1 = rel_luminance(c1); L2 = rel_luminance(c2)
-    lighter = max(L1, L2); darker = min(L1, L2)
+    L1 = rel_luminance(c1)
+    L2 = rel_luminance(c2)
+    lighter = max(L1, L2)
+    darker = min(L1, L2)
     return (lighter + 0.05) / (darker + 0.05)
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+# =========================
 # Alt suggestions
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 DECORATIVE_HINTS = re.compile(r"(border|spacer|decor|sprite|shadow|corner|bg|badge|icon)", re.I)
 
+
 def suggest_alt(src: str, width: Optional[int] = None, height: Optional[int] = None, site_name: str = "") -> Tuple[str, str]:
-    """Return (alt_text, classification) where classification ∈ {'decorative','logo','descriptive'}"""
+    """Return (alt_text, classification) classification in {'decorative','logo','descriptive'}"""
     path = urlparse(src).path if src else ""
     fname = path.split("/")[-1] if path else ""
     stem = re.sub(r"\.(png|jpg|jpeg|gif|svg|webp)$", "", fname, flags=re.I)
     tiny = (width and width < 24) or (height and height < 24)
+
     if tiny or DECORATIVE_HINTS.search(stem):
         return ("", "decorative")
     if re.search(r"logo", stem or "", re.I):
@@ -193,8 +176,8 @@ def suggest_alt(src: str, width: Optional[int] = None, height: Optional[int] = N
     human = (human[:77] + "…") if len(human) > 80 else human
     return (human or "Image", "descriptive")
 
+# Normalize image URL for dedupe (drop query/fragment)
 def normalize_src(src: str) -> str:
-    """Normalize image URL for dedupe (drop query/fragment)"""
     try:
         u = urlparse(src)
         if u.scheme and u.netloc:
@@ -203,13 +186,15 @@ def normalize_src(src: str) -> str:
     except Exception:
         return src
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Analyze HTML (inline contrast + alts)
-# ──────────────────────────────────────────────────────────────────────────────
+
+# =========================
+# Analysis: find inline styles and image alts
+# =========================
+
 def analyze_html(html: str, assume_bg: Tuple[int, int, int] = (255, 255, 255), site_name: str = "") -> Dict:
     soup = BeautifulSoup(html, "html.parser")
 
-    # Inline color contrast (from style attributes only)
+    # Text nodes with inline style color/background
     contrast_checked = 0
     contrast_failed = 0
     contrast_examples: List[Dict] = []
@@ -227,7 +212,8 @@ def analyze_html(html: str, assume_bg: Tuple[int, int, int] = (255, 255, 255), s
             continue
         ratio = contrast_ratio(fg, bg)
         contrast_checked += 1
-        if ratio < 4.5:  # WCAG 2.2 AA for normal text
+        # Assume normal text AA threshold 4.5:1
+        if ratio < 4.5:
             contrast_failed += 1
             if len(contrast_examples) < 8:
                 contrast_examples.append({
@@ -236,7 +222,7 @@ def analyze_html(html: str, assume_bg: Tuple[int, int, int] = (255, 255, 255), s
                     "tag": el.name,
                 })
 
-    # Images & alt checks
+    # Images & alt
     img_nodes = soup.find_all("img")
     alt_issues: List[Dict] = []
     seen_src = set()
@@ -249,9 +235,10 @@ def analyze_html(html: str, assume_bg: Tuple[int, int, int] = (255, 255, 255), s
             continue
         seen_src.add(norm)
         current_alt = (img.get("alt") or "").strip()
-        w = int(img.get("width") or 0) or None
-        h = int(img.get("height") or 0) or None
+        w = parse_dimension(img.get("width"))
+        h = parse_dimension(img.get("height"))
         alt_suggestion, cls = suggest_alt(src, w, h, site_name=site_name)
+        # Flag missing, generic, or decorative that should be empty alt
         if current_alt == "" or current_alt.lower() in {"image", "photo", "spacer", "graphic"}:
             alt_issues.append({"src": src, "suggested_alt": alt_suggestion, "classification": cls})
 
@@ -263,23 +250,27 @@ def analyze_html(html: str, assume_bg: Tuple[int, int, int] = (255, 255, 255), s
         "img_count": len(img_nodes),
     }
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+# =========================
 # Scoring
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
+
 def compute_scores(contrast_checked: int, contrast_failed: int, alt_issues_count: int) -> Dict:
     contrast_score = 100.0 if contrast_checked == 0 else max(0.0, 100.0 * (1 - (contrast_failed / max(1, contrast_checked))))
     overall = max(0.0, contrast_score - min(40.0, float(alt_issues_count)))
     return {"contrast_score": round(contrast_score, 1), "overall_score": round(overall, 1)}
 
-# ──────────────────────────────────────────────────────────────────────────────
+
+# =========================
 # PDF export (ReportLab)
-# ──────────────────────────────────────────────────────────────────────────────
+# =========================
 from reportlab.lib import colors
 from reportlab.lib.colors import HexColor
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.units import mm
+
 
 def export_pdf_wyndham(filepath: str, url: str, scores: Dict, contrast_checked: int, contrast_failed: int, alt_issues: List[Dict], notes: str = ""):
     doc = SimpleDocTemplate(filepath, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=18 * mm, bottomMargin=18 * mm)
@@ -299,7 +290,7 @@ def export_pdf_wyndham(filepath: str, url: str, scores: Dict, contrast_checked: 
         ["Overall Score", f"{scores['overall_score']}"],
         ["Contrast Score (%)", f"{scores['contrast_score']}"],
         ["Elements Checked (contrast)", f"{contrast_checked}"],
-        ["Contrast Fails", f"{contrast_failed}"],
+        ["Contrast Fails (inline-only)", f"{contrast_failed}"],
         ["Alt Issues (count)", f"{len(alt_issues)}"],
     ]
     tbl = Table(data, hAlign="LEFT", colWidths=[70 * mm, 70 * mm])
@@ -344,8 +335,8 @@ def export_pdf_wyndham(filepath: str, url: str, scores: Dict, contrast_checked: 
     story.append(Paragraph("Methods & Limitations", h2))
     story.append(
         Paragraph(
-            "This is a quick check. Inline styles are always scanned; you can enable computed-style contrast to include CSS colors. "
-            "A full WCAG audit should also include keyboard navigation, focus order, landmarks, ARIA, forms, and media alternatives.",
+            "This quick-check evaluates inline color contrast only. A full audit should also include computed style contrast, "
+            "keyboard navigation, focus order, semantic landmarks, ARIA roles/states, form labels, and media alternatives.",
             body,
         )
     )
@@ -355,36 +346,26 @@ def export_pdf_wyndham(filepath: str, url: str, scores: Dict, contrast_checked: 
 
     doc.build(story)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Header
-# ──────────────────────────────────────────────────────────────────────────────
-st.markdown(
-    """
+
+# =========================
+# UI
+# =========================
+
+
+# Inject brand CSS after set_page_config
+inject_brand_css()
+
+st.markdown("""
 <div class="wy-accents">
   <h1>Accessibility Auditor — WCAG 2.2 AA <span class="wy-pill">Wyndham</span></h1>
-  <p>Quick-check contrast, image alts, and export a Wyndham-branded PDF. Use the Test Panel for reliable demo pages.</p>
-  <p><small><b>Scope:</b> Inline contrast by default; optional computed-style contrast; alt issues with suggestions and CSV/PDF export. Not a full WCAG audit.</small></p>
+  <p>Quick‑check contrast (inline styles), image alts, and export a Wyndham‑branded PDF. Use the Test Panel for reliable demo pages.</p>
 </div>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Sidebar
-# ──────────────────────────────────────────────────────────────────────────────
+# Sidebar inputs
 with st.sidebar:
     st.header("Scan Settings")
-    url_input = st.text_input(
-        "Page URL to scan (HTML)",
-        value=st.session_state.get("url_input", ""),
-        placeholder="https://example.com/page"
-    )
-
-    use_computed = st.checkbox(
-        "Use computed-style contrast (headless)",
-        value=False,
-        help="Requires Playwright + Chromium."
-    )
+    url_input = st.text_input("Page URL to scan (HTML)", value=st.session_state.get("url_input", ""), placeholder="https://example.com/page")
 
     pdf_urls_raw = st.text_area("PDF URLs (one per line)", placeholder="https://…/policy.pdf")
 
@@ -402,35 +383,29 @@ with st.sidebar:
         use_pasted = st.checkbox("Use pasted HTML for this scan", value=False)
 
     st.markdown("---")
-    auto_save = st.checkbox(
-        "Auto-save after scan",
-        value=st.session_state.get("auto_save", True),
-        help="Automatically save successful scans to the Dashboard."
-    )
+    auto_save = st.checkbox("Auto-save after scan", value=st.session_state.get("auto_save", True), help="Automatically save successful scans to the Dashboard.")
     st.session_state["auto_save"] = auto_save
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Session state
-# ──────────────────────────────────────────────────────────────────────────────
+# Session history store
 if "history" not in st.session_state:
-    st.session_state["history"] = []
+    st.session_state["history"] = []  # each item: dict with timestamp, url, scores, counts
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Run Audit row
-# ──────────────────────────────────────────────────────────────────────────────
 st.subheader("Run Audit")
 col1, col2, col3 = st.columns([1, 1, 1])
-scan_html_clicked = col1.button("🔍 Scan HTML (Contrast & Alts)")
-scan_pdfs_clicked = col2.button("📁 Queue PDFs for scan", help="Add the URLs from the sidebar to the processing queue.")
-export_pdf_clicked = col3.button("💾 Generate PDF (Wyndham-branded)")
+
+scan_html_clicked = col1.button("\U0001F50D Scan HTML (Contrast & Alts)")
+scan_pdfs_clicked = col2.button("📁 Scan PDFs (Tagging & Alts)", disabled=True, help="Coming soon — HTML quick-check is live.")
+export_pdf_clicked = col3.button("\U0001F4BE Generate PDF (Wyndham‑branded)")
 
 st.markdown("---")
+
+# Results containers
 results_box = st.container()
+
 latest_run = st.session_state.get("latest_run")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HTML scan
-# ──────────────────────────────────────────────────────────────────────────────
+# ======== HTML scan ========
 if scan_html_clicked:
     if use_pasted and pasted_html.strip():
         html = pasted_html
@@ -456,17 +431,6 @@ if scan_html_clicked:
     else:
         with st.spinner("Analyzing HTML…"):
             report = analyze_html(html, assume_bg=(255, 255, 255), site_name="Wyndham City Council")
-
-            # Optional computed-style override
-            if use_computed and url_input.strip():
-                comp = analyze_computed_contrast(url_input.strip())
-                if comp and not comp.get("error"):
-                    report["contrast_checked"]  = int(comp.get("checked", report["contrast_checked"]))
-                    report["contrast_failed"]   = int(comp.get("failed",  report["contrast_failed"]))
-                    report["contrast_examples"] = comp.get("examples", report["contrast_examples"]) or []
-                else:
-                    st.warning(f"Computed-style contrast unavailable: {comp.get('error','unknown error') if isinstance(comp, dict) else 'error'} — showing inline-only results.")
-
             scores = compute_scores(report["contrast_checked"], report["contrast_failed"], len(report["alt_issues"]))
             latest_run = {
                 "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
@@ -478,7 +442,6 @@ if scan_html_clicked:
                 "contrast_examples": report["contrast_examples"],
             }
             st.session_state["latest_run"] = latest_run
-
             # Auto-save if enabled
             if st.session_state.get("auto_save", False):
                 st.session_state["history"].append(
@@ -494,22 +457,15 @@ if scan_html_clicked:
                 )
                 st.success("Saved automatically to Dashboard.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Queue PDFs (stub)
-# ──────────────────────────────────────────────────────────────────────────────
+# ======== PDF scan (placeholder) ========
 if scan_pdfs_clicked:
     urls = [u.strip() for u in pdf_urls_raw.splitlines() if u.strip()]
     if not urls:
         st.warning("Add PDF URLs (one per line) in the sidebar.")
     else:
-        q = st.session_state.setdefault("pdf_queue", [])
-        for u in urls:
-            q.append({"url": u, "status": "queued"})
-        st.success(f"Queued {len(urls)} PDF(s) for processing.")
+        st.info("PDF tagging/alt scanning is not implemented in this quick‑check build. The HTML audit is fully functional.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Export PDF
-# ──────────────────────────────────────────────────────────────────────────────
+# ======== Export PDF ========
 if export_pdf_clicked:
     run = st.session_state.get("latest_run")
     if not run:
@@ -527,9 +483,7 @@ if export_pdf_clicked:
         with open(path, "rb") as f:
             st.download_button("Download PDF report", f, file_name="audit_report.pdf")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Results
-# ──────────────────────────────────────────────────────────────────────────────
+# ======== Show results (if any) ========
 if latest_run:
     with results_box:
         st.subheader("Results")
@@ -538,43 +492,24 @@ if latest_run:
         m2.metric("Overall Score", latest_run["scores"]["overall_score"])
         m3.metric("Alt issues", len(latest_run["alt_issues"]))
 
-        # CSV downloads
+        # Quick downloads
         if latest_run["alt_issues"]:
-            alt_df = pd.DataFrame(latest_run["alt_issues"])  # src, suggested_alt, classification
-            st.download_button(
-                "Download CSV (Alt issues)",
-                data=alt_df.to_csv(index=False).encode("utf-8"),
-                file_name="alt_issues.csv",
-                mime="text/csv",
-            )
+            try:
+                import pandas as pd
+                alt_df = pd.DataFrame(latest_run["alt_issues"])  # src, suggested_alt, classification
+                csv_bytes = alt_df.to_csv(index=False).encode("utf-8")
+                st.download_button("Download CSV (Alt issues)", data=csv_bytes, file_name="alt_issues.csv", mime="text/csv")
+            except Exception:
+                pass
 
-        # Overall Issues CSV (contrast + alts)
-        overall_rows = []
-        for ex in latest_run.get("contrast_examples", [])[:200]:
-            overall_rows.append({
-                "type": "contrast", "tag": ex.get("tag",""), "text": ex.get("text",""),
-                "ratio": ex.get("ratio",""), "src": "", "suggested_alt": "", "classification": ""
-            })
-        for it in latest_run.get("alt_issues", []):
-            overall_rows.append({
-                "type": "alt", "tag": "img", "text": "", "ratio": "",
-                "src": it.get("src",""), "suggested_alt": it.get("suggested_alt",""), "classification": it.get("classification","")
-            })
-        if overall_rows:
-            overall_df = pd.DataFrame(overall_rows)
-            st.download_button(
-                "Download CSV (Overall issues)",
-                data=overall_df.to_csv(index=False).encode("utf-8"),
-                file_name="overall_issues.csv",
-                mime="text/csv",
-            )
-
+        # Expanders
         with st.expander("Contrast fails (examples)"):
             if latest_run["contrast_failed"] == 0:
-                st.write("No contrast failures found.")
+                st.write("No inline-style contrast failures found.")
             else:
+                st.write("Examples of elements that failed 1.4.3 (AA) threshold:")
                 for ex in latest_run.get("contrast_examples", [])[:10]:
-                    st.write(f"• <{ex.get('tag','?')}> ratio {ex.get('ratio','?')}: {ex.get('text','')}")
+                    st.write(f"• <{ex.get('tag','?')}> ratio {ex.get('ratio','?')}: {ex.get('text','')} ")
 
         with st.expander("Images missing alt text"):
             if not latest_run["alt_issues"]:
@@ -583,6 +518,7 @@ if latest_run:
                 for item in latest_run["alt_issues"]:
                     st.markdown(f"- `{item['src']}` → **{item['suggested_alt'] or '(decorative)'}** *({item['classification']})*")
 
+        # Auto Fix Suggestions
         st.subheader("Auto Fix Suggestions")
         if not latest_run["alt_issues"]:
             st.write("No suggestions. Nice!")
@@ -594,6 +530,7 @@ if latest_run:
                     suggestion = f"Add alt text: `<img src='{issue['src']}' alt='{issue['suggested_alt']}'>`"
                 st.code(suggestion, language="html")
 
+        # Save run
         if st.button("Save this run to Dashboard"):
             st.session_state["history"].append(
                 {
@@ -608,18 +545,20 @@ if latest_run:
             )
             st.success("Saved. See Dashboard below.")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Dashboard + PDF Queue
-# ──────────────────────────────────────────────────────────────────────────────
+# ======== Dashboard ========
 st.subheader("Dashboard")
+
 hist = st.session_state.get("history", [])
 if not hist:
     st.info("No history yet. Run a scan and Save.")
 else:
-    st.dataframe(pd.DataFrame(hist), use_container_width=True)
-    st.caption("Notes: Inline contrast by default. Enable 'computed-style contrast' to include CSS-based colors. Full audits also require keyboard/ARIA checks.")
+    # Simple table view
+    import pandas as pd
 
-q = st.session_state.get("pdf_queue", [])
-if q:
-    st.subheader("PDF Queue")
-    st.dataframe(pd.DataFrame(q), use_container_width=True)
+    df = pd.DataFrame(hist)
+    st.dataframe(df, use_container_width=True)
+
+    # Notes
+    st.caption(
+        "Notes: Contrast quick‑check uses inline styles only. Full audit requires computed styles, keyboard navigation, and ARIA checks."
+    )
