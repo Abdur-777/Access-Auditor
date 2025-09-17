@@ -1,0 +1,16 @@
+<!doctype html><html lang="en"><meta charset="utf-8">
+<title>Privacy Policy</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<h1>Privacy Policy</h1>
+<p><strong>Controller:</strong> {{ORG_NAME}}</p>
+<p>We process URLs you submit and the resulting scan artifacts (CSV/PDF) to deliver reports. We do not require end-user PII.
+Data is stored in <code>DATA_DIR</code> with retention of <code>RETENTION_DAYS</code> days, after which it is purged.</p>
+<h2>Data Categories</h2>
+<ul>
+  <li>Submitted page URLs, HTML responses (temporary, in-memory), derived findings.</li>
+  <li>Optional basic auth username for access control (hashed in logs; no cookies).</li>
+</ul>
+<h2>Security</h2>
+<p>Transport over HTTPS; access control via Basic Auth/SSO; rate limiting; daily backups; least-privileged hosting.</p>
+<h2>Your Rights</h2>
+<p>Admins can delete all stored data at any time via the “Delete all data” control or by contacting support.</p>
