@@ -1,0 +1,2 @@
+# min hr dom mon dow command
+30 2 * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1
