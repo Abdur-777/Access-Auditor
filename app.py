@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup, Tag
 import pandas as pd
 import streamlit as st
@@ -18,13 +20,13 @@ SMOKE_CASES = [
     ("Council Melbourne", "https://www.melbourne.vic.gov.au/", "ok"),
     ("Council Sydney",    "https://www.sydney.nsw.gov.au/",    "ok"),
     ("Council Brisbane",  "https://www.brisbane.qld.gov.au/",  "ok"),
-    ("404 page",          "https://httpstat.us/404",            "err:404"),
+    ("404 page",          "https://httpbin.org/status/404",     "err:404"),  # stable 404
     ("PDF file",          "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf", "err:application/pdf"),
     ("Long page",         "https://en.wikipedia.org/wiki/Australia", "ok"),
 ]
 
 def _smoke_expectation_passed(err: Optional[str], items: List[Dict[str, str]], expect: str) -> bool:
-    """Pass if we got HTML for 'ok', or the expected error token for 'err:<token>'."""
+    """Pass if we got HTML for 'ok', or the expected error token for 'err:<token>'. Looser 404 match."""
     if expect == "ok":
         return err is None
     if expect.startswith("err:"):
@@ -32,6 +34,8 @@ def _smoke_expectation_passed(err: Optional[str], items: List[Dict[str, str]], e
         hay = (err or "").lower()
         if not hay and items:
             hay = (items[0].get("snippet") or "").lower()
+        if token == "404":
+            return ("404" in hay) or ("not found" in hay)
         return token in hay
     return False
 
@@ -165,7 +169,7 @@ with cols_head[2]:
         toggle_theme()
         st.rerun()
 
-# Tabs (added 🧪 Smoke Test)
+# Tabs (includes 🧪 Smoke Test)
 scan_tab, results_tab, dashboard_tab, smoke_tab = st.tabs(
     ["🔍 Scan", "📊 Results", "📁 Dashboard", "🧪 Smoke Test"]
 )
@@ -178,10 +182,31 @@ scan_tab, results_tab, dashboard_tab, smoke_tab = st.tabs(
 URL_RE = re.compile(r"^https?://", re.I)
 
 GENERIC_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; AccessAuditor/1.0)",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en",
+    "Accept-Language": "en-AU,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+def _session_with_retries() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        raise_on_status=False,
+    )
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.headers.update(GENERIC_HEADERS)
+    return s
 
 def normalize_url(u: str) -> str:
     u = (u or "").strip()
@@ -192,14 +217,20 @@ def normalize_url(u: str) -> str:
     return u
 
 def fetch(url: str, timeout: int = 20) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """Fetch URL robustly with retries and a browser-like UA. Returns (html, error, status_code)."""
+    http = _session_with_retries()
     try:
-        r = requests.get(url, headers=GENERIC_HEADERS, timeout=timeout)
-        ct = r.headers.get("Content-Type", "")
+        r = http.get(url, timeout=timeout, allow_redirects=True)
+        ct = r.headers.get("Content-Type", "") or ""
         if "text/html" not in ct and "application/xhtml+xml" not in ct:
             return None, f"Unsupported content type: {ct}", r.status_code
-        r.raise_for_status()
+        r.raise_for_status()  # raises HTTPError on 4xx/5xx
         return r.text, None, r.status_code
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if getattr(e, "response", None) is not None else None
+        return None, str(e), status
     except requests.exceptions.RequestException as e:
+        # network/ssl/reset/timeouts
         return None, str(e), None
 
 def get_text_snippet(tag: Tag, max_len: int = 140) -> str:
@@ -536,7 +567,7 @@ with results_tab:
     c5.metric("Pages",cts["URLS"])
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # NEW: Grouped view (URL → Severity → Check)
+    # Grouped view (URL → Severity → Check)
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Grouped view")
     if df.empty:
@@ -592,7 +623,7 @@ with dashboard_tab:
     st.markdown("""
 - Start with your most-visited pages and forms; fix HIGH/MED first.
 - Replace vague anchor text (e.g., “click here”) with descriptive links.
-- Ensure inputs have `<label for="...">` or `aria-label`.
+- Ensure inputs have `<label for='...'>` or `aria-label`.
 - Avoid large heading jumps (e.g., `h2` → `h5`).
 - Inline-styled text with low contrast is flagged; also test real CSS themes.
     """)
