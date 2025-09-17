@@ -447,13 +447,50 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
 def df_to_json_bytes(df: pd.DataFrame) -> bytes:
     return df.to_json(orient="records", indent=2).encode("utf-8")
 
+# --------- UPDATED EXPORTER (clickable URLs, friendlier error, top summary) ----------
 def df_to_html_bytes(df: pd.DataFrame, title: str, branding: Dict) -> bytes:
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # Totals for the one-line summary (safe on empty frames)
+    pages = int(df["url"].nunique()) if (not df.empty and "url" in df.columns) else 0
+    total = int(len(df))
+    high = int((df["severity"].str.upper() == "HIGH").sum()) if "severity" in df.columns else 0
+    med  = int((df["severity"].str.upper() == "MED").sum())  if "severity" in df.columns else 0
+    low  = int((df["severity"].str.upper() == "LOW").sum())  if "severity" in df.columns else 0
+
+    # Export-only tweaks (don’t affect in-app tables)
+    df2 = df.copy()
+
+    # Friendlier error label
+    if "check" in df2.columns:
+        df2["check"] = df2["check"].replace(
+            {"Fetch failed": "Page not available (404/blocked/timeout)"}
+        )
+
+    # Clickable URL column
+    if "url" in df2.columns:
+        def _link(u: str) -> str:
+            u = str(u or "")
+            return f"<a href='{u}' target='_blank' rel='noopener noreferrer'>{u}</a>"
+        df2["url"] = df2["url"].apply(_link)
+
+    # Severity badges
+    if "severity" in df2.columns:
+        df2["severity"] = df2["severity"].apply(
+            lambda s: f"<span class='badge {s}'>{s}</span>"
+        )
+
+    html_table = df2.to_html(escape=False, index=False)
+
+    # Styles + summary line
     css = f"""
     <style>
       body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin:24px; }}
-      h1 {{ color:{branding['primary']}; }}
-      .summary {{ margin: 8px 0 16px 0; color:#475569; }}
+      h1 {{ color:{branding['primary']}; margin-bottom: 6px; }}
+      a {{ color:{branding['primary']}; text-decoration:none; }}
+      a:hover {{ text-decoration:underline; }}
+      .summary-top {{ margin: 6px 0 16px 0; font-weight:600; color:#334155; }}
+      .generated {{ margin: 4px 0 16px 0; color:#64748b; font-size:12px; }}
       table {{ border-collapse: collapse; width: 100%; }}
       th, td {{ text-align: left; padding: 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }}
       th {{ background:#f8fafc; }}
@@ -462,21 +499,35 @@ def df_to_html_bytes(df: pd.DataFrame, title: str, branding: Dict) -> bytes:
       .MED  {{ background:#fef3c7; color:#92400e; border:1px solid #fde68a; }}
       .LOW  {{ background:#ecfeff; color:#155e75; border:1px solid #a5f3fc; }}
       .muted {{ color:#64748b; font-size:12px; }}
+      .brand {{ font-weight:800;font-size:18px;color:{branding['primary']}; vertical-align:middle; }}
+      .brand img {{ height:44px;vertical-align:middle;margin-right:10px; }}
     </style>
     """
-    df2 = df.copy()
-    df2["severity"] = df2["severity"].apply(lambda s: f"<span class='badge {s}'>{s}</span>")
-    html_table = df2.to_html(escape=False, index=False)
-    html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>{css}</head>
+
+    summary_html = (
+        f"<div class='summary-top'>"
+        f"<strong>{pages}</strong> page(s) • "
+        f"{total} issue(s) "
+        f"(<span class='badge HIGH'>HIGH {high}</span> "
+        f"<span class='badge MED'>MED {med}</span> "
+        f"<span class='badge LOW'>LOW {low}</span>)"
+        f"</div>"
+    )
+
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+      <title>{title}</title>{css}</head>
     <body>
-      <img src="{branding['logo']}" alt="logo" style="height:44px;vertical-align:middle;margin-right:10px;"/>
-      <span style="font-weight:800;font-size:18px;color:{branding['primary']};">{branding['name']}</span>
+      <div class="brand">
+        <img src="{branding['logo']}" alt="logo"/>{branding['name']}
+      </div>
       <h1>Accessibility Audit Report</h1>
-      <div class="summary">Generated: {now}</div>
+      <div class="generated">Generated: {now}</div>
+      {summary_html}
       {html_table}
-      <p class="muted">This is a quick automated check. A manual review is recommended for WCAG conformance.</p>
+      <p class="muted">This is an automated WCAG pre-check. A manual review is recommended for conformance.</p>
     </body></html>"""
     return html.encode("utf-8")
+# -------------------------------------------------------------------------------------
 
 # -----------------------------
 # Session storage
