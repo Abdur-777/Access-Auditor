@@ -1,8 +1,26 @@
+# ── render.yaml ──────────────────────────────────────────────────────────────
 services:
   - type: web
-    name: access-auditor
-    env: python
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
-    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
+    name: wyndham-a11y
+    env: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: BRAND_PRIMARY
+        value: "#003B73"
+      - key: ORG_NAME
+        value: "Wyndham City Council"
+      - key: ENABLE_COMPUTED_CONTRAST
+        value: "true"
+      - key: DATA_DIR
+        value: "/app/data"
+      - key: RETENTION_DAYS
+        value: "90"
+      - key: LOG_LEVEL
+        value: "INFO"
+    # For persistent storage on Render use a Disk:
+    disk:
+      name: data
+      mountPath: /app/data
+      sizeGB: 1
