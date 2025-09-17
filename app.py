@@ -75,7 +75,7 @@ if "theme" not in st.session_state:
 def toggle_theme():
     st.session_state["theme"] = "dark" if st.session_state["theme"] == "light" else "light"
 
-# --- Dynamic theme CSS (replaces old THEME_CSS + wrapper div) ---
+# --- Dynamic theme CSS (styles the whole app; no wrapper div needed) ---
 theme = st.session_state.get("theme", "light")
 is_dark = theme == "dark"
 
@@ -133,14 +133,14 @@ with cols_head[1]:
 with cols_head[2]:
     st.write("")
     st.write("")
-    if st.button(("🌙 Dark mode" if st.session_state["theme"] == "light" else "☀️ Light mode"), use_container_width=True):
+    if st.button(("🌙 Dark mode" if st.session_state["theme"] == "light" else "☀️ Light mode"), use_container_width=True, key="toggle_theme"):
         toggle_theme()
         st.rerun()  # repaint immediately after toggle
 
 # Top nav (tabs)
 scan_tab, results_tab, dashboard_tab = st.tabs(["🔍 Scan", "📊 Results", "📁 Dashboard"])
 
-# --- Sidebar intentionally left empty (no council links / no data-dir tips) ---
+# --- Sidebar intentionally empty ---
 
 # -----------------------------
 # Helpers and checks
@@ -421,25 +421,37 @@ if "last_run_meta" not in st.session_state:
 # SCAN TAB
 # -----------------------------
 with scan_tab:
+    # Single URL card
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Run Audit")
-    st.caption("Scan a single URL or paste a list into the crawler.")
-
-    url = st.text_input("Page URL", value="https://www.australia.gov.au/")  # generic default
+    st.caption("Scan a single URL or paste multiple URLs in the batch tool.")
+    url = st.text_input("Page URL", value="https://www.australia.gov.au/", key="single_url")
     c1, c2 = st.columns([1,1])
     with c1:
-        run_single = st.button("Run Audit", type="primary", use_container_width=True)
+        run_single = st.button("Run Audit", use_container_width=True, key="btn_run_single")
     with c2:
-        clear_btn = st.button("Clear Results", use_container_width=True)
+        clear_btn = st.button("Clear Results", use_container_width=True, key="btn_clear")
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # Batch scan card (no expander → no overlap)
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    with st.expander("Crawler (batch) — paste multiple URLs"):
-        batch_text = st.text_area("One URL per line", height=180, placeholder="https://example.org/page-1\nhttps://example.org/page-2")
-        max_n = st.number_input("Max pages to scan (from list)", min_value=1, max_value=500, value=25, step=1)
-        run_batch = st.button("Run Batch Scan", use_container_width=True)
+    st.subheader("Batch scan")
+    st.caption("Paste multiple URLs (one per line)")
+    batch_text = st.text_area(
+        "URLs",
+        height=180,
+        placeholder="https://example.org/page-1\nhttps://example.org/page-2",
+        label_visibility="collapsed",
+        key="batch_urls",
+    )
+    c_run, c_pad, c_max = st.columns([1, 2, 1])
+    with c_run:
+        run_batch = st.button("Run Batch Scan", use_container_width=True, key="btn_run_batch")
+    with c_max:
+        max_n = st.number_input("Max pages", min_value=1, max_value=500, value=25, step=1, key="max_pages")
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # Actions
     if clear_btn:
         st.session_state["results"] = []
         st.session_state["last_run_meta"] = {}
@@ -459,7 +471,8 @@ with scan_tab:
             st.warning("No valid URLs provided.")
         else:
             results: List[Dict[str,str]] = []
-            prog = st.progress(0); status_area = st.empty()
+            prog = st.progress(0)
+            status_area = st.empty()
             n = min(len(urls), int(max_n))
             for i, u in enumerate(urls[:n], start=1):
                 status_area.write(f"Scanning {i}/{n}: {u}")
@@ -480,8 +493,11 @@ with results_tab:
     df = results_to_df(st.session_state.get("results", []))
     cts = summarize(df)
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("HIGH", cts["HIGH"]); c2.metric("MED", cts["MED"]); c3.metric("LOW", cts["LOW"])
-    c4.metric("Total", cts["TOTAL"]); c5.metric("Pages", cts["URLS"])
+    c1.metric("HIGH", cts["HIGH"])
+    c2.metric("MED",  cts["MED"])
+    c3.metric("LOW",  cts["LOW"])
+    c4.metric("Total",cts["TOTAL"])
+    c5.metric("Pages",cts["URLS"])
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
