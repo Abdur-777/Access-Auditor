@@ -1,0 +1,27 @@
+# /etc/nginx/sites-enabled/access-auditor.conf
+limit_req_zone $binary_remote_addr zone=scan:10m rate=30r/m;
+
+server {
+  listen 443 ssl http2;
+  server_name auditor.example.gov;
+  ssl_certificate /etc/letsencrypt/live/auditor.example.gov/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/auditor.example.gov/privkey.pem;
+
+  # Basic auth (replace with OIDC if preferred)
+  auth_basic "Restricted";
+  auth_basic_user_file /etc/nginx/.htpasswd;
+
+  location / {
+    proxy_pass http://app:8501;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    limit_req zone=scan burst=10 nodelay;
+  }
+}
+
+server {
+  listen 80;
+  server_name auditor.example.gov;
+  return 301 https://$host$request_uri;
+}
