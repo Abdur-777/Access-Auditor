@@ -283,15 +283,7 @@ def inline_style_dict(style: str) -> Dict[str, str]:
     out = {}
     for part in (style or "").split(";"):
         if ":" in part:
-            k,v = part split(":", 1)
-            out[k.strip().lower()] = v.strip()
-    return out
-# Fix typo: use correct split
-def inline_style_dict(style: str) -> Dict[str, str]:
-    out = {}
-    for part in (style or "").split(";"):
-        if ":" in part:
-            k, v = part.split(":", 1)
+            k, v = part.split(":", 1)  # ✅ fixed
             out[k.strip().lower()] = v.strip()
     return out
 
