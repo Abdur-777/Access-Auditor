@@ -25,6 +25,14 @@ SMOKE_CASES = [
     ("Long page",         "https://en.wikipedia.org/wiki/Australia", "ok"),
 ]
 
+# If a primary URL fails for 'ok' cases, try these alternates in order.
+SMOKE_ALTERNATIVES = {
+    "https://www.sydney.nsw.gov.au/": [
+        "https://www.nsw.gov.au/",
+        "https://www.vic.gov.au/",
+    ],
+}
+
 def _smoke_expectation_passed(err: Optional[str], items: List[Dict[str, str]], expect: str) -> bool:
     """Pass if we got HTML for 'ok', or the expected error token for 'err:<token>'. Looser 404 match."""
     if expect == "ok":
@@ -275,7 +283,15 @@ def inline_style_dict(style: str) -> Dict[str, str]:
     out = {}
     for part in (style or "").split(";"):
         if ":" in part:
-            k,v = part.split(":", 1)
+            k,v = part split(":", 1)
+            out[k.strip().lower()] = v.strip()
+    return out
+# Fix typo: use correct split
+def inline_style_dict(style: str) -> Dict[str, str]:
+    out = {}
+    for part in (style or "").split(";"):
+        if ":" in part:
+            k, v = part.split(":", 1)
             out[k.strip().lower()] = v.strip()
     return out
 
@@ -636,12 +652,12 @@ with dashboard_tab:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # -----------------------------
-# SMOKE TEST TAB
+# SMOKE TEST TAB (with alternates)
 # -----------------------------
 with smoke_tab:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("One-click Smoke Test")
-    st.caption("Runs 6 URLs (3 councils, a 404, a PDF, and a long page) and loads results into the Results tab.")
+    st.caption("Runs 6 URLs (3 councils, a 404, a PDF, and a long page). Uses alternates if a site blocks automated fetches. Results load into the Results tab.")
 
     if st.button("Run Smoke Test", use_container_width=True, key="btn_smoke"):
         rows: List[Dict[str, object]] = []
@@ -653,14 +669,36 @@ with smoke_tab:
 
         for i, (name, url, expect) in enumerate(SMOKE_CASES, start=1):
             status.write(f"Testing {i}/{total}: {name} — {url}")
-            issues, err = audit_url(url)
-            passed = _smoke_expectation_passed(err, issues, expect)
+
+            # Try primary (and alternates only for 'ok' cases)
+            candidates = [url] + (SMOKE_ALTERNATIVES.get(url, []) if expect == "ok" else [])
+            used = url
+            used_alt = False
+            issues: List[Dict[str, str]] = []
+            err: Optional[str] = None
+            passed = False
+
+            for candidate in candidates:
+                issues, err = audit_url(candidate)
+                if expect == "ok":
+                    if err is None:
+                        used = candidate
+                        used_alt = (candidate != url)
+                        passed = True
+                        break
+                else:
+                    if _smoke_expectation_passed(err, issues, expect):
+                        used = candidate
+                        used_alt = (candidate != url)
+                        passed = True
+                        break
 
             rows.append({
                 "name": name,
                 "url": url,
+                "resolved_url": used,
                 "expected": expect,
-                "passed": "✅" if passed else "❌",
+                "passed": "✅ (alt)" if (passed and used_alt) else ("✅" if passed else "❌"),
                 "issues_found": len(issues),
                 "error": err or "",
             })
@@ -670,7 +708,7 @@ with smoke_tab:
         # Load combined issues into the main Results tab so you can export them
         st.session_state["results"] = all_issues
         st.session_state["last_run_meta"] = {
-            "urls": [u for _, u, _ in SMOKE_CASES],
+            "urls": [r["resolved_url"] for r in rows],
             "ts": dt.datetime.utcnow().isoformat(),
             "suite": "smoke",
         }
