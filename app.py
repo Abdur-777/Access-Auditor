@@ -12,6 +12,30 @@ import pandas as pd
 import streamlit as st
 
 # -----------------------------
+# Preset smoke-test suite
+# -----------------------------
+SMOKE_CASES = [
+    ("Council Melbourne", "https://www.melbourne.vic.gov.au/", "ok"),
+    ("Council Sydney",    "https://www.sydney.nsw.gov.au/",    "ok"),
+    ("Council Brisbane",  "https://www.brisbane.qld.gov.au/",  "ok"),
+    ("404 page",          "https://httpstat.us/404",            "err:404"),
+    ("PDF file",          "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf", "err:application/pdf"),
+    ("Long page",         "https://en.wikipedia.org/wiki/Australia", "ok"),
+]
+
+def _smoke_expectation_passed(err: Optional[str], items: List[Dict[str, str]], expect: str) -> bool:
+    """Pass if we got HTML for 'ok', or the expected error token for 'err:<token>'."""
+    if expect == "ok":
+        return err is None
+    if expect.startswith("err:"):
+        token = expect.split(":", 1)[1].lower()
+        hay = (err or "").lower()
+        if not hay and items:
+            hay = (items[0].get("snippet") or "").lower()
+        return token in hay
+    return False
+
+# -----------------------------
 # Writable data directories
 # -----------------------------
 def resolve_data_dir() -> str:
@@ -65,23 +89,20 @@ st.set_page_config(
     page_title=APP_NAME,
     page_icon="✅",
     layout="wide",
-    initial_sidebar_state="collapsed",  # sidebar hidden by default
+    initial_sidebar_state="collapsed",
 )
 
 # Hide Streamlit chrome (menu + footer)
-st.markdown(
-    "<style>#MainMenu{visibility:hidden} footer{visibility:hidden}</style>",
-    unsafe_allow_html=True,
-)
+st.markdown("<style>#MainMenu{visibility:hidden} footer{visibility:hidden}</style>", unsafe_allow_html=True)
 
 # Light/Dark toggle state
 if "theme" not in st.session_state:
-    st.session_state["theme"] = "light"  # or "dark"
+    st.session_state["theme"] = "light"
 
 def toggle_theme():
     st.session_state["theme"] = "dark" if st.session_state["theme"] == "light" else "light"
 
-# --- Dynamic theme CSS (styles the whole app; no wrapper div needed) ---
+# --- Dynamic theme CSS (styles the whole app) ---
 theme = st.session_state.get("theme", "light")
 is_dark = theme == "dark"
 
@@ -142,10 +163,12 @@ with cols_head[2]:
     if st.button(("🌙 Dark mode" if st.session_state["theme"] == "light" else "☀️ Light mode"),
                  use_container_width=True, key="toggle_theme"):
         toggle_theme()
-        st.rerun()  # repaint immediately after toggle
+        st.rerun()
 
-# Top nav (tabs)
-scan_tab, results_tab, dashboard_tab = st.tabs(["🔍 Scan", "📊 Results", "📁 Dashboard"])
+# Tabs (added 🧪 Smoke Test)
+scan_tab, results_tab, dashboard_tab, smoke_tab = st.tabs(
+    ["🔍 Scan", "📊 Results", "📁 Dashboard", "🧪 Smoke Test"]
+)
 
 # --- Sidebar intentionally empty ---
 
@@ -448,7 +471,7 @@ with scan_tab:
 
     # Batch Scan card
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Batch Scan")  # Title case
+    st.subheader("Batch Scan")
     st.caption("Paste multiple URLs (one per line)")
     batch_text = st.text_area(
         "URLs",
@@ -513,6 +536,20 @@ with results_tab:
     c5.metric("Pages",cts["URLS"])
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # NEW: Grouped view (URL → Severity → Check)
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Grouped view")
+    if df.empty:
+        st.caption("No results yet.")
+    else:
+        df_group = (
+            df.groupby(["url", "severity", "check"])
+              .size().reset_index(name="count")
+              .sort_values(["url", "severity", "count"], ascending=[True, True, False])
+        )
+        st.dataframe(df_group, use_container_width=True, hide_index=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Issues")
     if df.empty:
@@ -565,4 +602,49 @@ with dashboard_tab:
     st.subheader("Last Run")
     last = st.session_state.get("last_run_meta") or {}
     st.json(last or {"note": "No scans yet."})
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# -----------------------------
+# SMOKE TEST TAB
+# -----------------------------
+with smoke_tab:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("One-click Smoke Test")
+    st.caption("Runs 6 URLs (3 councils, a 404, a PDF, and a long page) and loads results into the Results tab.")
+
+    if st.button("Run Smoke Test", use_container_width=True, key="btn_smoke"):
+        rows: List[Dict[str, object]] = []
+        all_issues: List[Dict[str, str]] = []
+
+        prog = st.progress(0)
+        status = st.empty()
+        total = len(SMOKE_CASES)
+
+        for i, (name, url, expect) in enumerate(SMOKE_CASES, start=1):
+            status.write(f"Testing {i}/{total}: {name} — {url}")
+            issues, err = audit_url(url)
+            passed = _smoke_expectation_passed(err, issues, expect)
+
+            rows.append({
+                "name": name,
+                "url": url,
+                "expected": expect,
+                "passed": "✅" if passed else "❌",
+                "issues_found": len(issues),
+                "error": err or "",
+            })
+            all_issues.extend(issues)
+            prog.progress(int(i / total * 100))
+
+        # Load combined issues into the main Results tab so you can export them
+        st.session_state["results"] = all_issues
+        st.session_state["last_run_meta"] = {
+            "urls": [u for _, u, _ in SMOKE_CASES],
+            "ts": dt.datetime.utcnow().isoformat(),
+            "suite": "smoke",
+        }
+
+        st.success("Smoke test complete — results loaded into the Results tab.")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
     st.markdown('</div>', unsafe_allow_html=True)
