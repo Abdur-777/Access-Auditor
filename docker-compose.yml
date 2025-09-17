@@ -1,55 +1,21 @@
-version: "3.9"
-
-volumes:
-  data: {}         # persistent app data (CSVs/PDFs/logs)
-  backups: {}      # backup archives (.tgz)
+version: "3.8"
 
 services:
   app:
     build: .
-    env_file: .env
-    command: >
-      streamlit run app.py
-      --server.address 0.0.0.0
-      --server.port 8501
-    expose:
-      - "8501"
-    volumes:
-      - data:/var/app/data
-    restart: unless-stopped
-    # Uncomment to ship container logs to CloudWatch (requires AWS creds on host):
-    # logging:
-    #   driver: awslogs
-    #   options:
-    #     awslogs-region: ap-southeast-2
-    #     awslogs-group: access-auditor
-    #     awslogs-stream: app
-
-  nginx:
-    image: nginx:1.25
-    depends_on:
-      - app
+    image: wcag-auditor:latest
+    container_name: wcag-auditor
     ports:
-      - "80:80"            # put behind TLS in prod (ALB/ingress or cert companion)
-    volumes:
-      - ./ops/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./docs:/usr/share/nginx/html/docs:ro
-    restart: unless-stopped
-    # logging:
-    #   driver: awslogs
-    #   options:
-    #     awslogs-region: ap-southeast-2
-    #     awslogs-group: access-auditor
-    #     awslogs-stream: nginx
-
-  backup:
-    image: alpine:3.19
+      - "8501:8501"
     environment:
-      - RETENTION_DAYS=${RETENTION_DAYS:-90}
+      # Branding & org
+      ORG_NAME: "Wyndham City Council"
+      BRAND_PRIMARY: "#003B73"
+      # Persistence (inside container); mapped to a host volume below
+      DATA_DIR: "/app/data"
+      # If you run behind a proxy, you can set these:
+      # STREAMLIT_SERVER_ENABLE_CORS: "false"
+      # STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION: "true"
     volumes:
-      - data:/var/app/data:ro
-      - backups:/backups
-      - ./ops/backup.sh:/usr/local/bin/backup.sh:ro
-      - ./ops/backup-crontab:/etc/crontabs/root:ro
-    entrypoint: ["/bin/sh","-c","chmod +x /usr/local/bin/backup.sh && crond -f -l 8"]
+      - ./data:/app/data
     restart: unless-stopped
