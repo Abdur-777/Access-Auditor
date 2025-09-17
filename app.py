@@ -283,7 +283,7 @@ def inline_style_dict(style: str) -> Dict[str, str]:
     out = {}
     for part in (style or "").split(";"):
         if ":" in part:
-            k, v = part.split(":", 1)  # ✅ fixed
+            k, v = part.split(":", 1)
             out[k.strip().lower()] = v.strip()
     return out
 
@@ -626,6 +626,7 @@ with results_tab:
 # DASHBOARD TAB
 # -----------------------------
 with dashboard_tab:
+    # Tips card
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Quick Tips")
     st.markdown("""
@@ -637,10 +638,31 @@ with dashboard_tab:
     """)
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # Cleaner "Last Run" card (no code/JSON)
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Last Run")
+
     last = st.session_state.get("last_run_meta") or {}
-    st.json(last or {"note": "No scans yet."})
+    urls = last.get("urls") or []
+    ts_iso = last.get("ts")
+
+    if not urls:
+        st.caption("No scans yet.")
+    else:
+        # When & how many
+        when = ts_iso.replace("T", " ").split(".")[0] if isinstance(ts_iso, str) else "—"
+        cols = st.columns(3)
+        cols[0].metric("Pages", len(urls))
+        cols[1].metric("When", when)
+        cols[2].metric("Suite", last.get("suite", "manual"))
+
+        # Show up to 8 URLs as a neat list
+        show = urls[:8]
+        st.markdown("\n".join([f"- [{u}]({u})" for u in show]))
+        if len(urls) > len(show):
+            st.caption(f"+{len(urls) - len(show)} more…")
+
+        st.caption("Tip: Open the **Results** tab to explore issues or export a report.")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # -----------------------------
