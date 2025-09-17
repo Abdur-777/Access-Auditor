@@ -49,10 +49,6 @@ def inject_brand_css():
             display:inline-block; background: color-mix(in srgb, var(--wy) 12%, white);
             color: var(--wy); padding:2px 10px; border-radius:999px; font-weight:700; font-size:12px;
           }}
-          .wy-badge {{
-            display:inline-block; margin-left:6px; padding:2px 8px; border-radius:999px;
-            background: color-mix(in srgb, var(--wy) 10%, white); color: var(--wy); font-size:11px; font-weight:700;
-          }}
           .wy-muted {{ color:#4b5563; }}
           footer {{ visibility:hidden; }}
         </style>
@@ -308,7 +304,7 @@ def analyze_html(html: str, assume_bg: Tuple[int, int, int] = (255,255,255), sit
         if current_alt == "" or bad_generic or bad_filename:
             alt_issues.append({"src": src, "suggested_alt": alt_suggestion, "classification": cls})
 
-    # Links that are images only with no text or label and empty alt
+    # Links that are images only with no text/label and empty alt
     for a in soup.find_all("a"):
         imgs = a.find_all("img")
         if not imgs: continue
@@ -465,24 +461,32 @@ with st.sidebar:
 
     st.caption("Please ensure you have permission to scan the URL. Respect robots.txt and site terms.")
     st.markdown("---")
-    auto_save = st.checkbox("Auto-save successful scans to Dashboard", value=st.session_state.get("auto_save", True))
-    st.session_state["auto_save"] = auto_save
-    if st.button("Reset form"):
-        for k in ("url_input","latest_run"): st.session_state.pop(k, None)
-        st.experimental_rerun()
+    cols = st.columns([1,1])
+    with cols[0]:
+        auto_save = st.checkbox("Auto-save successful scans to Dashboard", value=st.session_state.get("auto_save", True))
+        st.session_state["auto_save"] = auto_save
+    with cols[1]:
+        if st.button("Reset form", use_container_width=True):
+            for k in ("url_input","latest_run"): st.session_state.pop(k, None)
+            st.experimental_rerun()
 
 # Session state priming
 st.session_state.setdefault("history", [])
 st.session_state.setdefault("latest_run", None)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Actions (stacked vertically for clarity)
+# Run buttons — side-by-side layout
 # ──────────────────────────────────────────────────────────────────────────────
 st.subheader("Run")
-scan_html_clicked   = st.button("🔍 Scan HTML (Contrast & Images)")
-export_pdf_clicked  = st.button("💾 Generate Audit PDF")
-conf_form_open      = st.button("📄 Draft Conformance Statement (open form)")
-evidence_pack_click = st.button("📦 Build Evidence Pack (.zip)")
+c1, c2, c3, c4 = st.columns([1, 1, 1, 1], gap="small")
+with c1:
+    scan_html_clicked = st.button("🔍 Scan HTML (Contrast & Images)", use_container_width=True)
+with c2:
+    export_pdf_clicked = st.button("💾 Generate Audit PDF", use_container_width=True)
+with c3:
+    conf_form_open = st.button("📄 Draft Conformance Statement (open form)", use_container_width=True)
+with c4:
+    evidence_pack_click = st.button("📦 Build Evidence Pack (.zip)", use_container_width=True)
 
 st.markdown("---")
 
@@ -781,8 +785,7 @@ if evidence_pack_click:
             # attach audit pdf
             with open(audit_path, "rb") as f:
                 z.writestr("audit_report.pdf", f.read())
-            # attach draft conformance (markdown; PDF if generated)
-            # Create a simple meta based on run
+            # attach draft conformance (markdown)
             conf_md = io.StringIO()
             conf_md.write(f"# Draft WCAG 2.2 {run['wcag_level']} Conformance Statement — {ORG_NAME}\n\n")
             conf_md.write(f"- **Site:** {run['url']}\n")
