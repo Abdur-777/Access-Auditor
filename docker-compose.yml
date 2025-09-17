@@ -1,21 +1,20 @@
+# ── docker-compose.yml ───────────────────────────────────────────────────────
 version: "3.8"
-
 services:
   app:
     build: .
-    image: wcag-auditor:latest
-    container_name: wcag-auditor
+    image: wyndham-a11y:latest
     ports:
       - "8501:8501"
     environment:
-      # Branding & org
-      ORG_NAME: "Wyndham City Council"
       BRAND_PRIMARY: "#003B73"
-      # Persistence (inside container); mapped to a host volume below
+      ORG_NAME: "Wyndham City Council"
+      ENABLE_COMPUTED_CONTRAST: "true"
       DATA_DIR: "/app/data"
-      # If you run behind a proxy, you can set these:
-      # STREAMLIT_SERVER_ENABLE_CORS: "false"
-      # STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION: "true"
+      RETENTION_DAYS: "90"
+      LOG_LEVEL: "INFO"
+      # Optional auth:
+      # BASIC_AUTH_USER: "admin"
+      # BASIC_AUTH_PASS: "supersecret"
     volumes:
       - ./data:/app/data
-    restart: unless-stopped
