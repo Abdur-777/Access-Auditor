@@ -1,21 +1,38 @@
+# ---- Base ----
 FROM python:3.11-slim
 
-# System deps for Playwright/Chromium & ReportLab fonts
-RUN apt-get update && apt-get install -y \
-    wget gnupg libnss3 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 \
-    libxcursor1 libxdamage1 libxi6 libxtst6 libglib2.0-0 libxrandr2 \
-    libatk1.0-0 libatk-bridge2.0-0 libdrm2 libgbm1 libxfixes3 libpango-1.0-0 \
-    libgtk-3-0 fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    # Streamlit runtime
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
- && python -m playwright install chromium
 
-COPY . .
-ENV DATA_DIR=/var/app/data \
-    PYTHONUNBUFFERED=1
-RUN mkdir -p ${DATA_DIR}
+# System deps (minimal; Playwright --with-deps will add the rest)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates fonts-liberation \
+ && rm -rf /var/lib/apt/lists/*
+
+# Python deps
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+# Install Chromium for Playwright (so "Use computed-style contrast" works)
+RUN python -m playwright install --with-deps chromium
+
+# App
+COPY app.py ./app.py
+
+# Data dir for exports/logs (mount a volume here in compose)
+RUN mkdir -p /app/data
 
 EXPOSE 8501
+
+# Optional: run as non-root
+RUN useradd -ms /bin/bash appuser && chown -R appuser:appuser /app
+USER appuser
+
 CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]
