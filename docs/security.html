@@ -1,0 +1,12 @@
+<!doctype html><html lang="en"><meta charset="utf-8">
+<title>Security One-Pager</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<h1>Security One-Pager</h1>
+<ul>
+  <li><strong>Hosting:</strong> Region-locked (e.g., AWS ap-southeast-2); HTTPS via reverse proxy.</li>
+  <li><strong>Access Control:</strong> Basic Auth or SSO (OIDC). Per-tenant isolation recommended.</li>
+  <li><strong>Data:</strong> Stored under <code>DATA_DIR</code> on persistent volume; nightly backups; 30–90d retention.</li>
+  <li><strong>App:</strong> Rate limiting, request timeouts, audit logs, minimal PII.</li>
+  <li><strong>Monitoring:</strong> /health endpoint, container logs shipped to CloudWatch/ELK.</li>
+  <li><strong>Business Continuity:</strong> Volume snapshots, tested restore.</li>
+</ul>
