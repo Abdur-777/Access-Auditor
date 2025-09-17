@@ -68,54 +68,60 @@ st.set_page_config(
     initial_sidebar_state="collapsed",  # sidebar hidden by default
 )
 
-# Light/Dark toggle (CSS driven)
+# Light/Dark toggle state
 if "theme" not in st.session_state:
     st.session_state["theme"] = "light"  # or "dark"
 
 def toggle_theme():
     st.session_state["theme"] = "dark" if st.session_state["theme"] == "light" else "light"
 
-THEME_CSS = f"""
+# --- Dynamic theme CSS (replaces old THEME_CSS + wrapper div) ---
+theme = st.session_state.get("theme", "light")
+is_dark = theme == "dark"
+
+bg      = "#0f172a" if is_dark else "#ffffff"   # page background
+text    = "#e5e7eb" if is_dark else "#0b1220"   # main text
+card_bg = "#0f172a" if is_dark else "#ffffff"   # card background
+border  = "#1f2937" if is_dark else "#e2e8f0"   # borders
+muted   = "#cbd5e1" if is_dark else "#64748b"   # captions/muted
+table_h = "#111827" if is_dark else "#f8fafc"   # table header
+
+st.markdown(f"""
 <style>
-:root {{
-  --wy-primary: {PRIMARY};
-  --card-bg-light: #ffffff;
-  --card-bg-dark: #0f172a;
-  --text-light: #0b1220;
-  --text-dark: #e5e7eb;
-  --muted-light: #64748b;
-  --muted-dark: #cbd5e1;
-  --border-light: #e2e8f0;
-  --border-dark: #1f2937;
-}}
-.app-container.light {{ color: var(--text-light); }}
-.app-container.dark  {{ color: var(--text-dark); }}
+:root {{ --wy-primary: {PRIMARY}; }}
+
+/* App background + text */
+html, body, .stApp {{ background: {bg}; color: {text}; }}
+
+/* Cards */
 .card {{
-  border: 1px solid var(--border-light);
+  border: 1px solid {border};
   border-radius: 16px;
   padding: 18px 18px 16px 18px;
-  background: var(--card-bg-light);
-  box-shadow: 0 2px 18px rgba(0,0,0,0.06);
+  background: {card_bg};
+  box-shadow: 0 2px 18px rgba(0,0,0,{0.35 if is_dark else 0.06});
 }}
-.dark .card {{
-  border-color: var(--border-dark);
-  background: var(--card-bg-dark);
-  box-shadow: 0 2px 18px rgba(0,0,0,0.35);
+
+/* Tabs underline */
+[data-baseweb="tab-list"] {{ border-bottom: 2px solid {border}; }}
+
+/* DataFrame header */
+.stDataFrame thead tr th {{ background: {table_h}; color: {text}; }}
+
+/* Buttons (primary look) */
+.stButton > button, .stDownloadButton > button {{
+  background: var(--wy-primary);
+  color: #fff;
+  border: none;
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-weight: 700;
 }}
-.badge {{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }}
-.badge.HIGH  {{ background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }}
-.badge.MED   {{ background:#fef3c7; color:#92400e; border:1px solid #fde68a; }}
-.badge.LOW   {{ background:#ecfeff; color:#155e75; border:1px solid #a5f3fc; }}
-.topnav {{
-  display:flex; gap:10px; align-items:center; justify-content:space-between;
-  padding: 8px 0 2px 0; border-bottom: 2px solid rgba(0,0,0,0.06);
-}}
-.topnav .left {{ display:flex; gap:12px; align-items:center; }}
-.topnav a {{ text-decoration:none; font-weight:600; color: var(--wy-primary); }}
-.dark .topnav {{ border-color: #1f2937; }}
+
+/* Muted/caption */
+.small, .stCaption, .stMarkdown p small {{ color: {muted}; }}
 </style>
-"""
-st.markdown(THEME_CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # Header with logo + theme toggle
 cols_head = st.columns([1, 6, 2])
@@ -129,9 +135,7 @@ with cols_head[2]:
     st.write("")
     if st.button(("🌙 Dark mode" if st.session_state["theme"] == "light" else "☀️ Light mode"), use_container_width=True):
         toggle_theme()
-
-container_class = "dark" if st.session_state["theme"] == "dark" else "light"
-st.markdown(f'<div class="app-container {container_class}">', unsafe_allow_html=True)
+        st.rerun()  # repaint immediately after toggle
 
 # Top nav (tabs)
 scan_tab, results_tab, dashboard_tab = st.tabs(["🔍 Scan", "📊 Results", "📁 Dashboard"])
@@ -533,6 +537,3 @@ with dashboard_tab:
     last = st.session_state.get("last_run_meta") or {}
     st.json(last or {"note": "No scans yet."})
     st.markdown('</div>', unsafe_allow_html=True)
-
-# Close themed container
-st.markdown('</div>', unsafe_allow_html=True)
