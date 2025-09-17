@@ -1,12 +1,13 @@
+# ── .streamlit/config.toml ───────────────────────────────────────────────────
 [server]
 headless = true
-address = "0.0.0.0"
-port = 8501
-enableCORS = true
 enableXsrfProtection = true
-
-[browser]
-gatherUsageStats = false
+enableCORS = false  # fronted by container/network; restrict via gateway if needed
+maxUploadSize = 50
 
 [theme]
 primaryColor = "#003B73"
+base = "light"
+
+[browser]
+gatherUsageStats = false
