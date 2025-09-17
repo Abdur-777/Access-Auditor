@@ -1,13 +1,6 @@
-# ── .streamlit/config.toml ───────────────────────────────────────────────────
 [server]
 headless = true
+address = "0.0.0.0"
+# port is injected by Render via $PORT when you start the app
 enableXsrfProtection = true
-enableCORS = false  # fronted by container/network; restrict via gateway if needed
-maxUploadSize = 50
-
-[theme]
-primaryColor = "#003B73"
-base = "light"
-
-[browser]
-gatherUsageStats = false
+# Omit enableCORS entirely (defaults to true when XSRF is enabled)
