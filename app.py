@@ -1,8 +1,8 @@
-# app.py — Accessibility Auditor (WCAG quick-check) with Wyndham presets
+# app.py — Accessibility Auditor (generic, no council branding)
 # Run: streamlit run app.py
 
 from __future__ import annotations
-import os, re, io, json, time, tempfile, math, textwrap, datetime as dt
+import os, re, io, json, time, tempfile, math, textwrap, base64, datetime as dt
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -34,31 +34,39 @@ for _d in (UPLOADS_DIR, EXPORTS_DIR, CACHE_DIR):
     Path(_d).mkdir(parents=True, exist_ok=True)
 
 # -----------------------------
-# Branding / Wyndham presets
+# Generic brand (no council)
 # -----------------------------
-WYNDHAM = {
-    "name": "Wyndham City Council",
-    "logo": "https://www.wyndham.vic.gov.au/themes/custom/wyndham/logo.png",
-    "primary": "#003B73",
-    "links": {
-        "Home": "https://www.wyndham.vic.gov.au/",
-        "Waste & Recycling": "https://www.wyndham.vic.gov.au/services/waste-recycling",
-        "Bin collection": "https://www.wyndham.vic.gov.au/residents/waste-recycling/bin-collection",
-        "Accessibility statement": "https://www.wyndham.vic.gov.au/about-council/your-council/accessibility",
-        "Contact": "https://www.wyndham.vic.gov.au/contact-us",
-    },
-}
+PRIMARY = os.getenv("BRAND_PRIMARY", "#0F4C81")  # classic civic blue
+APP_NAME = os.getenv("BRAND_NAME", "Accessibility Auditor")
+BRAND_LOGO_URL = os.getenv("BRAND_LOGO_URL", "")  # supply your own if you like
 
-GENERIC_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; AccessAuditor/1.0; +https://access-auditor)",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en",
-}
+def civic_logo_data_uri(primary: str) -> str:
+    """Simple civic/pillars SVG as a data URI (no external dependencies)."""
+    svg = f"""
+    <svg width="120" height="120" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+      <rect width="120" height="120" rx="24" fill="{primary}"/>
+      <polygon points="60,22 18,44 102,44" fill="white"/>
+      <rect x="26" y="48" width="68" height="8" fill="white"/>
+      <rect x="32" y="56" width="10" height="38" fill="white"/>
+      <rect x="55" y="56" width="10" height="38" fill="white"/>
+      <rect x="78" y="56" width="10" height="38" fill="white"/>
+      <rect x="22" y="94" width="76" height="6" fill="white"/>
+    </svg>
+    """.strip()
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode()
+
+BRAND_LOGO = BRAND_LOGO_URL if BRAND_LOGO_URL else civic_logo_data_uri(PRIMARY)
+BRAND = {"name": APP_NAME, "primary": PRIMARY, "logo": BRAND_LOGO}
 
 # -----------------------------
 # UI Setup
 # -----------------------------
-st.set_page_config(page_title="Accessibility Auditor", page_icon="✅", layout="wide")
+st.set_page_config(
+    page_title=APP_NAME,
+    page_icon="✅",
+    layout="wide",
+    initial_sidebar_state="collapsed",  # sidebar hidden by default
+)
 
 # Light/Dark toggle (CSS driven)
 if "theme" not in st.session_state:
@@ -67,7 +75,6 @@ if "theme" not in st.session_state:
 def toggle_theme():
     st.session_state["theme"] = "dark" if st.session_state["theme"] == "light" else "light"
 
-PRIMARY = WYNDHAM["primary"]
 THEME_CSS = f"""
 <style>
 :root {{
@@ -81,12 +88,8 @@ THEME_CSS = f"""
   --border-light: #e2e8f0;
   --border-dark: #1f2937;
 }}
-.app-container.light {{
-  color: var(--text-light);
-}}
-.app-container.dark {{
-  color: var(--text-dark);
-}}
+.app-container.light {{ color: var(--text-light); }}
+.app-container.dark  {{ color: var(--text-dark); }}
 .card {{
   border: 1px solid var(--border-light);
   border-radius: 16px;
@@ -99,12 +102,7 @@ THEME_CSS = f"""
   background: var(--card-bg-dark);
   box-shadow: 0 2px 18px rgba(0,0,0,0.35);
 }}
-.kbd {{
-  border: 1px solid #ced4da; padding: 1px 6px; border-radius: 6px; font-size: 0.85rem;
-}}
-.badge {{
-  display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600;
-}}
+.badge {{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }}
 .badge.HIGH  {{ background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }}
 .badge.MED   {{ background:#fef3c7; color:#92400e; border:1px solid #fde68a; }}
 .badge.LOW   {{ background:#ecfeff; color:#155e75; border:1px solid #a5f3fc; }}
@@ -112,18 +110,9 @@ THEME_CSS = f"""
   display:flex; gap:10px; align-items:center; justify-content:space-between;
   padding: 8px 0 2px 0; border-bottom: 2px solid rgba(0,0,0,0.06);
 }}
-.topnav .left {{
-  display:flex; gap:12px; align-items:center;
-}}
-.topnav a {{
-  text-decoration:none; font-weight:600; color: var(--wy-primary);
-}}
+.topnav .left {{ display:flex; gap:12px; align-items:center; }}
+.topnav a {{ text-decoration:none; font-weight:600; color: var(--wy-primary); }}
 .dark .topnav {{ border-color: #1f2937; }}
-.button-primary {{
-  background: var(--wy-primary); color:white; padding: 8px 14px; border-radius: 999px; font-weight:700; border: none;
-}}
-.small {{ color: var(--muted-light); font-size: 12px; }}
-.dark .small {{ color: var(--muted-dark); }}
 </style>
 """
 st.markdown(THEME_CSS, unsafe_allow_html=True)
@@ -131,10 +120,10 @@ st.markdown(THEME_CSS, unsafe_allow_html=True)
 # Header with logo + theme toggle
 cols_head = st.columns([1, 6, 2])
 with cols_head[0]:
-    st.image(WYNDHAM["logo"], width=86)
+    st.image(BRAND["logo"], width=86)
 with cols_head[1]:
-    st.markdown(f"### Accessibility Auditor — {WYNDHAM['name']}")
-    st.caption("Quick WCAG checks for council pages (beta)")
+    st.markdown(f"### {APP_NAME}")
+    st.caption("Quick WCAG checks for public pages (beta)")
 with cols_head[2]:
     st.write("")
     st.write("")
@@ -147,19 +136,18 @@ st.markdown(f'<div class="app-container {container_class}">', unsafe_allow_html=
 # Top nav (tabs)
 scan_tab, results_tab, dashboard_tab = st.tabs(["🔍 Scan", "📊 Results", "📁 Dashboard"])
 
-# Sidebar info
-with st.sidebar:
-    st.markdown("#### Council links")
-    for label, url in WYNDHAM["links"].items():
-        st.markdown(f"- [{label}]({url})")
-    st.markdown("---")
-    st.caption(f"Data dir: `{DATA_DIR}`")
-    st.caption("Tip: Add a Render Disk and set `DATA_DIR=/var/data/access-auditor` for persistence.")
+# --- Sidebar intentionally left empty (no council links / no data-dir tips) ---
 
 # -----------------------------
 # Helpers and checks
 # -----------------------------
 URL_RE = re.compile(r"^https?://", re.I)
+
+GENERIC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; AccessAuditor/1.0)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en",
+}
 
 def normalize_url(u: str) -> str:
     u = (u or "").strip()
@@ -193,16 +181,14 @@ def parse_color(value: str) -> Optional[Tuple[float, float, float]]:
     if not value:
         return None
     value = value.strip().lower()
-    # hex
-    m = re.match(r"#([0-9a-f]{{3,8}})", value)
+    m = re.match(r"#([0-9a-f]{3,8})", value)
     if m:
         h = m.group(1)
-        if len(h) in (3, 4):  # #rgb or #rgba
+        if len(h) in (3, 4):
             r = int(h[0]*2, 16); g = int(h[1]*2, 16); b = int(h[2]*2, 16)
         else:
             r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
         return (r/255.0, g/255.0, b/255.0)
-    # rgb()
     m = re.match(r"rgb\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\)", value)
     if m:
         r, g, b = map(lambda x: float(x)/255.0, m.groups())
@@ -252,8 +238,7 @@ def analyze_html(url: str, html: str) -> List[Dict[str, str]]:
 
     # 3) Images need alt
     for img in soup.find_all("img"):
-        alt = img.get("alt")
-        role = img.get("role")
+        alt = img.get("alt"); role = img.get("role")
         if role == "presentation":
             continue
         if alt is None or alt.strip() == "":
@@ -266,27 +251,21 @@ def analyze_html(url: str, html: str) -> List[Dict[str, str]]:
     # 4) Form controls need accessible name
     form_controls = soup.find_all(["input","select","textarea"])
     for el in form_controls:
-        # ignore hidden
         if el.name == "input" and (el.get("type") or "").lower() == "hidden":
             continue
         has_label = False
-        # aria
         if el.get("aria-label") or el.get("aria-labelledby"):
             has_label = True
-        # associated label by id/for
         el_id = el.get("id")
         if el_id:
             lbl = soup.find("label", attrs={"for": el_id})
             if lbl and lbl.get_text(strip=True):
                 has_label = True
-        # wrapped label
         if not has_label:
             parent = el.parent
             while isinstance(parent, Tag):
-                if parent.name == "label":
-                    if parent.get_text(strip=True):
-                        has_label = True
-                        break
+                if parent.name == "label" and parent.get_text(strip=True):
+                    has_label = True; break
                 parent = parent.parent
         if not has_label:
             issues.append(dict(
@@ -299,24 +278,22 @@ def analyze_html(url: str, html: str) -> List[Dict[str, str]]:
     heading_levels = []
     for h in soup.find_all(re.compile(r"^h[1-6]$")):
         try:
-            level = int(h.name[1])
-            heading_levels.append((level, get_text_snippet(h)))
+            level = int(h.name[1]); heading_levels.append((level, get_text_snippet(h)))
         except Exception:
             pass
     for i in range(1, len(heading_levels)):
         prev, _ = heading_levels[i-1]
         curr, snippet = heading_levels[i]
-        if curr - prev > 1:  # jump e.g., h2 -> h5
+        if curr - prev > 1:
             issues.append(dict(
                 url=url, check="Heading level jump", severity="LOW",
                 tag=f"h{curr}", snippet=snippet,
-                recommendation="Avoid skipping heading levels; adjust to maintain hierarchical structure."
+                recommendation="Avoid skipping heading levels; maintain hierarchical structure."
             ))
 
     # 6) Tables: ensure header cells
     for tbl in soup.find_all("table"):
-        has_th = bool(tbl.find("th"))
-        if not has_th:
+        if not tbl.find("th"):
             issues.append(dict(
                 url=url, check="Table without headers", severity="MED",
                 tag="table", snippet=get_text_snippet(tbl),
@@ -336,13 +313,11 @@ def analyze_html(url: str, html: str) -> List[Dict[str, str]]:
     # 8) Basic color contrast for inline-styled text
     for el in soup.find_all(True):
         style = inline_style_dict(el.get("style") or "")
-        if not style:
-            continue
+        if not style: continue
         fg = parse_color(style.get("color", ""))
         bg = parse_color(style.get("background-color", ""))
         if fg and bg:
             ratio = contrast_ratio(fg, bg)
-            # large text if font-size >= 18px or bold & >=14px
             fs = px_value(style.get("font-size","") or "")
             weight = (style.get("font-weight","") or "400")
             large = (fs and fs >= 18.0) or ((fs and fs >= 14.0) and (weight.isdigit() and int(weight) >= 700))
@@ -351,9 +326,8 @@ def analyze_html(url: str, html: str) -> List[Dict[str, str]]:
                 issues.append(dict(
                     url=url, check="Low color contrast", severity="HIGH",
                     tag=el.name, snippet=get_text_snippet(el),
-                    recommendation=f"Increase contrast (ratio {ratio:.2f} < {threshold:.1f}); adjust text or background colors."
+                    recommendation=f"Increase contrast (ratio {ratio:.2f} < {threshold:.1f}); adjust text or background."
                 ))
-
     return issues
 
 def audit_url(url: str) -> Tuple[List[Dict[str,str]], Optional[str]]:
@@ -364,7 +338,7 @@ def audit_url(url: str) -> Tuple[List[Dict[str,str]], Optional[str]]:
     if err or not html:
         return [dict(
             url=url, check="Fetch failed", severity="HIGH", tag="-",
-            snippet=str(err or f"HTTP {status}"), recommendation="Verify URL and connectivity; ensure page returns HTML."
+            snippet=str(err or f"HTTP {status}"), recommendation="Verify URL and connectivity; ensure the page returns HTML."
         )], err or f"HTTP {status}"
     issues = analyze_html(url, html)
     return issues, None
@@ -373,10 +347,8 @@ def results_to_df(results: List[Dict[str,str]]) -> pd.DataFrame:
     if not results:
         return pd.DataFrame(columns=["url","severity","check","tag","snippet","recommendation"])
     df = pd.DataFrame(results)
-    # enforce column order
     cols = ["url","severity","check","tag","snippet","recommendation"]
     df = df[[c for c in cols if c in df.columns]]
-    # sort by severity
     sev_order = {"HIGH":0,"MED":1,"LOW":2}
     df["sev_rank"] = df["severity"].map(lambda s: sev_order.get(str(s).upper(), 9))
     df = df.sort_values(["sev_rank","url","check"]).drop(columns=["sev_rank"])
@@ -387,8 +359,7 @@ def summarize(df: pd.DataFrame) -> Dict[str,int]:
         return {"HIGH":0,"MED":0,"LOW":0,"TOTAL":0,"URLS":0}
     cts = df["severity"].str.upper().value_counts().to_dict()
     out = {"HIGH": cts.get("HIGH",0), "MED": cts.get("MED",0), "LOW": cts.get("LOW",0)}
-    out["TOTAL"] = int(df.shape[0])
-    out["URLS"]  = int(df["url"].nunique())
+    out["TOTAL"] = int(df.shape[0]); out["URLS"] = int(df["url"].nunique())
     return out
 
 def save_json(obj: dict, name: str) -> str:
@@ -438,9 +409,9 @@ def df_to_html_bytes(df: pd.DataFrame, title: str, branding: Dict) -> bytes:
 # Session storage
 # -----------------------------
 if "results" not in st.session_state:
-    st.session_state["results"] = []   # list of dict rows
+    st.session_state["results"] = []
 if "last_run_meta" not in st.session_state:
-    st.session_state["last_run_meta"] = {}  # {"urls": [...], "ts": ...}
+    st.session_state["last_run_meta"] = {}
 
 # -----------------------------
 # SCAN TAB
@@ -450,13 +421,12 @@ with scan_tab:
     st.subheader("Run Audit")
     st.caption("Scan a single URL or paste a list into the crawler.")
 
-    url = st.text_input("Page URL", value="https://www.wyndham.vic.gov.au/services/waste-recycling")
+    url = st.text_input("Page URL", value="https://www.australia.gov.au/")  # generic default
     c1, c2 = st.columns([1,1])
     with c1:
         run_single = st.button("Run Audit", type="primary", use_container_width=True)
     with c2:
         clear_btn = st.button("Clear Results", use_container_width=True)
-
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -485,8 +455,7 @@ with scan_tab:
             st.warning("No valid URLs provided.")
         else:
             results: List[Dict[str,str]] = []
-            prog = st.progress(0)
-            status_area = st.empty()
+            prog = st.progress(0); status_area = st.empty()
             n = min(len(urls), int(max_n))
             for i, u in enumerate(urls[:n], start=1):
                 status_area.write(f"Scanning {i}/{n}: {u}")
@@ -507,11 +476,8 @@ with results_tab:
     df = results_to_df(st.session_state.get("results", []))
     cts = summarize(df)
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("HIGH", cts["HIGH"])
-    c2.metric("MED",  cts["MED"])
-    c3.metric("LOW",  cts["LOW"])
-    c4.metric("Total",cts["TOTAL"])
-    c5.metric("Pages",cts["URLS"])
+    c1.metric("HIGH", cts["HIGH"]); c2.metric("MED", cts["MED"]); c3.metric("LOW", cts["LOW"])
+    c4.metric("Total", cts["TOTAL"]); c5.metric("Pages", cts["URLS"])
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -519,9 +485,7 @@ with results_tab:
     if df.empty:
         st.info("No results yet. Run a scan on the **Scan** tab.")
     else:
-        # colorize severity in-line
-        df_view = df.copy()
-        st.dataframe(df_view, use_container_width=True, hide_index=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -531,20 +495,18 @@ with results_tab:
     else:
         now_slug = dt.datetime.now().strftime("%Y%m%d_%H%M")
         base = f"access_audit_{now_slug}"
-
-        csv_bytes = df_to_csv_bytes(df)
+        csv_bytes  = df_to_csv_bytes(df)
         json_bytes = df_to_json_bytes(df)
-        html_bytes = df_to_html_bytes(df, title=f"{WYNDHAM['name']} — Accessibility Audit", branding=WYNDHAM)
+        html_bytes = df_to_html_bytes(df, title=f"{APP_NAME} — Report", branding=BRAND)
 
         c1, c2, c3 = st.columns([1,1,1])
         with c1:
-            st.download_button("⬇️ CSV", data=csv_bytes, file_name=f"{base}.csv", mime="text/csv", use_container_width=True)
+            st.download_button("⬇️ CSV",  data=csv_bytes,  file_name=f"{base}.csv",  mime="text/csv", use_container_width=True)
         with c2:
             st.download_button("⬇️ JSON", data=json_bytes, file_name=f"{base}.json", mime="application/json", use_container_width=True)
         with c3:
             st.download_button("⬇️ HTML", data=html_bytes, file_name=f"{base}.html", mime="text/html", use_container_width=True)
 
-        # Persist a copy server-side (optional)
         try:
             save_json({"meta": st.session_state.get("last_run_meta", {}), "rows": st.session_state["results"]}, f"{base}.saved.json")
         except Exception as e:
@@ -556,13 +518,13 @@ with results_tab:
 # -----------------------------
 with dashboard_tab:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Quick Links & Tips")
-    st.markdown(f"""
-- **Wyndham Presets** — Try scanning:  
-  - {WYNDHAM['links']['Waste & Recycling']}  
-  - {WYNDHAM['links']['Bin collection']}  
-- **Interpreting results** — These are quick, automated checks focusing on common WCAG pitfalls.  
-- **Next steps** — Use this as a triage tool; confirm with manual testing & a screen reader.
+    st.subheader("Quick Tips")
+    st.markdown("""
+- Start with your most-visited pages and forms; fix HIGH/MED first.
+- Replace vague anchor text (e.g., “click here”) with descriptive links.
+- Ensure inputs have `<label for="...">` or `aria-label`.
+- Avoid large heading jumps (e.g., `h2` → `h5`).
+- Inline-styled text with low contrast is flagged; also test real CSS themes.
     """)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -572,5 +534,5 @@ with dashboard_tab:
     st.json(last or {"note": "No scans yet."})
     st.markdown('</div>', unsafe_allow_html=True)
 
-# Close the themed container
+# Close themed container
 st.markdown('</div>', unsafe_allow_html=True)
