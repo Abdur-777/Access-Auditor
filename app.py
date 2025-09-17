@@ -68,6 +68,12 @@ st.set_page_config(
     initial_sidebar_state="collapsed",  # sidebar hidden by default
 )
 
+# Hide Streamlit chrome (menu + footer)
+st.markdown(
+    "<style>#MainMenu{visibility:hidden} footer{visibility:hidden}</style>",
+    unsafe_allow_html=True,
+)
+
 # Light/Dark toggle state
 if "theme" not in st.session_state:
     st.session_state["theme"] = "light"  # or "dark"
@@ -133,7 +139,8 @@ with cols_head[1]:
 with cols_head[2]:
     st.write("")
     st.write("")
-    if st.button(("🌙 Dark mode" if st.session_state["theme"] == "light" else "☀️ Light mode"), use_container_width=True, key="toggle_theme"):
+    if st.button(("🌙 Dark mode" if st.session_state["theme"] == "light" else "☀️ Light mode"),
+                 use_container_width=True, key="toggle_theme"):
         toggle_theme()
         st.rerun()  # repaint immediately after toggle
 
@@ -425,7 +432,13 @@ with scan_tab:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Run Audit")
     st.caption("Scan a single URL or paste multiple URLs in the batch tool.")
-    url = st.text_input("Page URL", value="https://www.australia.gov.au/", key="single_url")
+    url = st.text_input(
+        "Page URL",
+        value="https://www.australia.gov.au/",
+        placeholder="https://example.gov.au/path",
+        label_visibility="collapsed",
+        key="single_url",
+    )
     c1, c2 = st.columns([1,1])
     with c1:
         run_single = st.button("Run Audit", use_container_width=True, key="btn_run_single")
@@ -433,9 +446,9 @@ with scan_tab:
         clear_btn = st.button("Clear Results", use_container_width=True, key="btn_clear")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Batch scan card (no expander → no overlap)
+    # Batch Scan card
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Batch scan")
+    st.subheader("Batch Scan")  # Title case
     st.caption("Paste multiple URLs (one per line)")
     batch_text = st.text_area(
         "URLs",
