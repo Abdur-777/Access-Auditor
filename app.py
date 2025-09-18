@@ -2,7 +2,7 @@
 # Run: streamlit run app.py
 
 from __future__ import annotations
-import os, re, io, json, time, tempfile, math, textwrap, base64, datetime as dt
+import os, re, json, tempfile, base64, datetime as dt, asyncio
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -12,6 +12,7 @@ from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup, Tag
 import pandas as pd
 import streamlit as st
+import httpx
 
 # -----------------------------
 # Preset smoke-test suite
@@ -224,53 +225,11 @@ def normalize_url(u: str) -> str:
         u = "https://" + u
     return u
 
-# --------- OPTIONAL headless-browser fetch (only used if USE_PLAYWRIGHT=1) ----------
-def fetch_with_playwright(url: str, timeout: int = 20):
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:
-        return None, f"Playwright not installed: {e}", None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            ctx = browser.new_context(
-                user_agent=GENERIC_HEADERS["User-Agent"],
-                locale="en-AU",
-                java_script_enabled=True,
-            )
-            page = ctx.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            html = page.content()
-            browser.close()
-            return html, None, 200
-    except Exception as e:
-        return None, f"Playwright fetch failed: {e}", None
-# ------------------------------------------------------------------------------------
-
 def fetch(url: str, timeout: int = 20) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-    """
-    Fetch URL with retries and browser-like headers.
-    Adds Referer + Sec-Fetch* to pass common WAFs.
-    If blocked (403/406/503) and USE_PLAYWRIGHT=1, falls back to headless Chromium.
-    Returns (html, error, status_code).
-    """
+    """Fetch URL robustly with retries and a browser-like UA. Returns (html, error, status_code)."""
     http = _session_with_retries()
-
-    # Stronger headers to look like a real navigation request
-    hdrs = {
-        **GENERIC_HEADERS,
-        "Referer": "https://www.google.com/",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-User": "?1",
-        "Sec-Fetch-Dest": "document",
-        "DNT": "1",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
-    }
-
     try:
-        r = http.get(url, timeout=timeout, allow_redirects=True, headers=hdrs)
+        r = http.get(url, timeout=timeout, allow_redirects=True)
         ct = r.headers.get("Content-Type", "") or ""
         if "text/html" not in ct and "application/xhtml+xml" not in ct:
             return None, f"Unsupported content type: {ct}", r.status_code
@@ -278,12 +237,6 @@ def fetch(url: str, timeout: int = 20) -> Tuple[Optional[str], Optional[str], Op
         return r.text, None, r.status_code
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if getattr(e, "response", None) is not None else None
-        # Optional fallback for WAF blocks
-        if status in (403, 406, 503) and os.getenv("USE_PLAYWRIGHT", "0") == "1":
-            html, perr, pstatus = fetch_with_playwright(url, timeout)
-            if html:
-                return html, None, pstatus or 200
-            return None, perr or str(e), status
         return None, str(e), status
     except requests.exceptions.RequestException as e:
         # network/ssl/reset/timeouts
@@ -434,7 +387,8 @@ def analyze_html(url: str, html: str) -> List[Dict[str, str]]:
     # 8) Basic color contrast for inline-styled text
     for el in soup.find_all(True):
         style = inline_style_dict(el.get("style") or "")
-        if not style: continue
+        if not style:
+            continue
         fg = parse_color(style.get("color", ""))
         bg = parse_color(style.get("background-color", ""))
         if fg and bg:
@@ -578,6 +532,75 @@ def df_to_html_bytes(df: pd.DataFrame, title: str, branding: Dict) -> bytes:
 # -------------------------------------------------------------------------------------
 
 # -----------------------------
+# Async batch scanning (fast)
+# -----------------------------
+MAX_CONCURRENCY = int(os.getenv("AA_MAX_CONCURRENCY", "10"))
+REQUEST_TIMEOUT = float(os.getenv("AA_TIMEOUT", "8.0"))
+RETRIES = int(os.getenv("AA_RETRIES", "2"))
+
+async def _afetch(client: httpx.AsyncClient, url: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """Async fetch with retries/backoff. Returns (html, error, status_code)."""
+    err, status = None, None
+    for attempt in range(RETRIES + 1):
+        try:
+            r = await client.get(
+                url,
+                timeout=REQUEST_TIMEOUT,
+                follow_redirects=True,
+                headers=GENERIC_HEADERS,
+            )
+            ct = (r.headers.get("content-type") or "").lower()
+            if "text/html" not in ct and "application/xhtml+xml" not in ct:
+                return None, f"Unsupported content type: {ct}", r.status_code
+            r.raise_for_status()
+            return r.text, None, r.status_code
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            err = str(e)
+        except httpx.HTTPError as e:
+            err = str(e)
+        # jittered exponential backoff
+        await asyncio.sleep(0.25 * (2 ** attempt))
+    return None, err, status
+
+async def _audit_url_async(client: httpx.AsyncClient, url: str) -> List[Dict[str, str]]:
+    u = normalize_url(url)
+    if not u:
+        return [dict(
+            url=url, check="Fetch failed", severity="HIGH", tag="-",
+            snippet="Empty URL.", recommendation="Enter a valid URL."
+        )]
+    html, err, status = await _afetch(client, u)
+    if err or not html:
+        return [dict(
+            url=u, check="Fetch failed", severity="HIGH", tag="-",
+            snippet=str(err or f"HTTP {status}"),
+            recommendation="Verify URL and connectivity; ensure the page returns HTML."
+        )]
+    return analyze_html(u, html)
+
+async def _audit_batch_async(urls: List[str], update_progress) -> List[Dict[str, str]]:
+    limits = httpx.Limits(max_connections=MAX_CONCURRENCY, max_keepalive_connections=MAX_CONCURRENCY)
+    timeout = httpx.Timeout(REQUEST_TIMEOUT)
+    results: List[Dict[str, str]] = []
+    async with httpx.AsyncClient(http2=True, limits=limits, timeout=timeout) as client:
+        tasks = [_audit_url_async(client, u) for u in urls]
+        done = 0
+        total = len(tasks)
+        for coro in asyncio.as_completed(tasks):
+            issues = await coro
+            results.extend(issues)
+            done += 1
+            update_progress(done, total)
+    return results
+
+def run_batch_concurrent(urls: List[str], prog, status_area) -> List[Dict[str, str]]:
+    def _update_progress(done, total):
+        prog.progress(int(done / total * 100))
+        status_area.write(f"Scanning {done}/{total}")
+    return asyncio.run(_audit_batch_async(urls, _update_progress))
+
+# -----------------------------
 # Session storage
 # -----------------------------
 if "results" not in st.session_state:
@@ -644,15 +667,10 @@ with scan_tab:
         if not urls:
             st.warning("No valid URLs provided.")
         else:
-            results: List[Dict[str,str]] = []
             prog = st.progress(0)
             status_area = st.empty()
             n = min(len(urls), int(max_n))
-            for i, u in enumerate(urls[:n], start=1):
-                status_area.write(f"Scanning {i}/{n}: {u}")
-                items, _ = audit_url(u)
-                results.extend(items)
-                prog.progress(int(i/n*100))
+            results = run_batch_concurrent(urls[:n], prog, status_area)
             st.session_state["results"] = results
             st.session_state["last_run_meta"] = {"urls": urls[:n], "ts": dt.datetime.utcnow().isoformat()}
             cts = summarize(results_to_df(results))
@@ -791,8 +809,10 @@ with smoke_tab:
             err: Optional[str] = None
             passed = False
 
+            # Use the regular (sync) audit for simplicity; it's plenty fast for 6 URLs
             for candidate in candidates:
-                issues, err = audit_url(candidate)
+                items, err = audit_url(candidate)
+                issues = items
                 if expect == "ok":
                     if err is None:
                         used = candidate
@@ -815,11 +835,12 @@ with smoke_tab:
                 "issues_found": len(issues),
                 "error": err or "",
             })
-            all_issues.extend(issues)
             prog.progress(int(i / total * 100))
 
         # Load combined issues into the main Results tab so you can export them
-        st.session_state["results"] = all_issues
+        st.session_state["results"] = sum(
+            [audit_url(r["resolved_url"])[0] for r in rows], start=[]
+        )
         st.session_state["last_run_meta"] = {
             "urls": [r["resolved_url"] for r in rows],
             "ts": dt.datetime.utcnow().isoformat(),
