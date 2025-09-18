@@ -1,5 +1,5 @@
-# app.py — Accessibility Auditor (polite, 403-resistant)
-# Run: streamlit run app.py
+# app.py — Accessibility Auditor (polite fetch + Playwright fallback)
+# Run: PLAYWRIGHT=1 python3 -m streamlit run app.py
 from __future__ import annotations
 
 import os, re, io, json, time, tempfile, base64, datetime as dt, asyncio, random
@@ -18,9 +18,16 @@ import httpx
 # =========================
 # Feature toggles / config
 # =========================
-PLAYWRIGHT_ENABLED = os.getenv("PLAYWRIGHT", "0") == "1"
+PLAYWRIGHT_ENV = os.getenv("PLAYWRIGHT", "0")  # "1" to enable browser fallback
 RATE_LIMIT_PER_HOST = float(os.getenv("RATE_LIMIT_PER_HOST", "0.9"))  # seconds between hits to same host
 DEFAULT_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "22"))
+
+# Try importing Playwright up-front so we can display a clear diagnostic in the UI
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore
+    PW_OK = True
+except Exception:
+    PW_OK = False
 
 # -----------------------------
 # Preset smoke-test suite
@@ -121,16 +128,27 @@ html, body, .stApp {{ background: {bg}; color: {text}; }}
 .stDataFrame thead tr th {{ background:{table_h}; color:{text}; }}
 .stButton > button, .stDownloadButton > button {{ background:var(--wy-primary); color:#fff; border:none; border-radius:999px; padding:8px 14px; font-weight:700; }}
 .small, .stCaption, .stMarkdown p small {{ color:{muted}; }}
+.badge-dot {{ display:inline-block; width:10px; height:10px; border-radius:50%; vertical-align:middle; margin-right:6px; }}
 </style>
 """, unsafe_allow_html=True)
 
-cols_head = st.columns([1,6,2])
+cols_head = st.columns([1,6,3])
 with cols_head[0]: st.image(BRAND["logo"], width=86)
 with cols_head[1]:
     st.markdown(f"### {APP_NAME}")
-    st.caption("Polite, cookie-aware fetcher with optional headless-browser fallback.")
+    st.caption("Polite, cookie-aware fetcher with **real-browser fallback**.")
 with cols_head[2]:
-    st.write(""); st.write("")
+    # Diagnostics banner
+    dot_color = "#16a34a" if (PW_OK and PLAYWRIGHT_ENV == "1") else "#ef4444"
+    st.markdown(
+        f"<div class='small'>"
+        f"<span class='badge-dot' style='background:{dot_color}'></span>"
+        f"Playwright available: <strong>{'Yes' if PW_OK else 'No'}</strong> · "
+        f"Env PLAYWRIGHT=<strong>{PLAYWRIGHT_ENV}</strong>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+    st.write("")
     if st.button(("🌙 Dark mode" if st.session_state["theme"] == "light" else "☀️ Light mode"),
                  use_container_width=True, key="toggle_theme"):
         toggle_theme(); st.rerun()
@@ -178,32 +196,30 @@ def _host_root(url: str) -> str:
     p = urlparse(url)
     return f"{p.scheme}://{p.netloc}/"
 
-# --------- Playwright fallback ----------
-def fetch_via_browser(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Optional[str]]:
-    if not PLAYWRIGHT_ENABLED:
-        return None, "Playwright disabled"
+# --------- Browser fallback (Playwright) ----------
+def fetch_via_browser(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    if not (PW_OK and PLAYWRIGHT_ENV == "1"):
+        return None, "Playwright disabled or not available", None
     try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:
-        return None, f"Playwright not available: {e}"
-
-    url = normalize_url(url)
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-gpu"])
-        ctx = browser.new_context(user_agent=random.choice(UA_POOL))
-        page = ctx.new_page()
-        try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--disable-gpu"])
+            ctx = browser.new_context(user_agent=random.choice(UA_POOL))
+            page = ctx.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout*1000)
-            page.wait_for_timeout(800)  # small settle time
+            page.wait_for_timeout(800)  # small settle time for light JS
             html = page.content()
-            return html, None
-        except Exception as e:
-            return None, f"Browser fetch failed: {e}"
-        finally:
             ctx.close(); browser.close()
+            return html, None, 200
+    except Exception as e:
+        return None, f"Playwright fetch failed: {e}", None
 
-# --------- 403-friendly SYNC fetch with warm-up, cookies, referer, http2 fallback ----------
-def fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+# --------- 403-friendly SYNC fetch with warm-up, cookies, referer, http2 fallback, THEN Playwright ----------
+def fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Optional[str], Optional[int], str]:
+    """
+    Returns (html, error, status, method_used)
+    method_used in {"requests","httpx","playwright","-"}
+    """
+    method_used = "-"
     s = _session_with_retries()
     ua = random.choice(UA_POOL)
     s.headers.update({"User-Agent": ua})
@@ -225,34 +241,40 @@ def fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Opti
             r = s.get(url, headers=attempt["headers"], timeout=timeout, allow_redirects=True)
             last_status = r.status_code
             ct = r.headers.get("Content-Type", "") or ""
-            if 200 <= r.status_code < 300 and _is_html(ct) and r.text.strip():
-                return r.text, None, r.status_code
+            if 200 <= r.status_code < 300 and _is_html(ct) and (r.text or "").strip():
+                method_used = "requests"
+                return r.text, None, r.status_code, method_used
             if (r.status_code not in (401,403)) and (not _is_html(ct)):
-                return None, f"Unsupported content type: {ct}", r.status_code
+                return None, f"Unsupported content type: {ct}", r.status_code, method_used
             last_err = f"HTTP {r.status_code}"
         except requests.RequestException as e:
             last_err = str(e); last_status = None
         time.sleep(backoff + random.random()*0.4); backoff *= 1.6
 
-    # Final fallback: httpx http2=True with same cookies
+    # httpx fallback (HTTP/2) with cookies
     try:
         cookie_header = requests.utils.dict_from_cookiejar(s.cookies)
         with httpx.Client(http2=True, headers={**GENERIC_HEADERS, "User-Agent": ua, "Referer": url},
                           cookies=cookie_header, timeout=timeout, follow_redirects=True) as c:
             r3 = c.get(url)
             ct3 = r3.headers.get("Content-Type", "")
-            if 200 <= r3.status_code < 300 and _is_html(ct3) and r3.text.strip():
-                return r3.text, None, r3.status_code
+            if 200 <= r3.status_code < 300 and _is_html(ct3) and (r3.text or "").strip():
+                method_used = "httpx"
+                return r3.text, None, r3.status_code, method_used
             if not _is_html(ct3):
-                return None, f"Unsupported content type: {ct3}", r3.status_code
-            return None, f"HTTP {r3.status_code}", r3.status_code
+                return None, f"Unsupported content type: {ct3}", r3.status_code, method_used
+            last_err, last_status = f"HTTP {r3.status_code}", r3.status_code
     except Exception as e:
-        # Optional final-final: Playwright
-        if PLAYWRIGHT_ENABLED:
-            html, berr = fetch_via_browser(url, timeout=timeout)
-            if html and not berr:
-                return html, None, 200
-        return None, f"Fetch failed: {last_err or e}", last_status
+        last_err = f"httpx error: {e}"
+
+    # Final: Playwright browser
+    html_pw, err_pw, st_pw = fetch_via_browser(url, timeout=timeout)
+    if html_pw and not err_pw:
+        method_used = "playwright"
+        return html_pw, None, st_pw or 200, method_used
+
+    # Give up
+    return None, (err_pw or last_err or "Fetch failed"), last_status, method_used
 
 # --------- HTML analysis (WCAG quick checks) ----------
 def get_text_snippet(tag: Tag, max_len: int = 140) -> str:
@@ -375,24 +397,22 @@ def analyze_html(url: str, html: str) -> List[Dict[str,str]]:
                                    recommendation=f"Increase contrast (ratio {ratio:.2f} < {threshold:.1f})."))
     return issues
 
-def audit_url(url: str) -> Tuple[List[Dict[str,str]], Optional[str]]:
+def audit_url(url: str) -> Tuple[List[Dict[str,str]], Optional[str], str]:
+    """
+    Returns (issues, error, method_used)
+    method_used mirrors fetch(): {"requests","httpx","playwright","-"}
+    """
     url = normalize_url(url)
-    if not url: return [], "Empty URL."
-    html, err, status = fetch(url)
-    if (err or not html) and PLAYWRIGHT_ENABLED:
-        # Try browser fallback if enabled
-        html2, berr = fetch_via_browser(url)
-        if html2 and not berr:
-            return analyze_html(url, html2), None
-        if berr and not err: err = berr
+    if not url: return [], "Empty URL.", "-"
+    html, err, status, method_used = fetch(url)
     if err or not html:
         return [dict(url=url, check="Fetch failed", severity="HIGH", tag="-",
                      snippet=str(err or f"HTTP {status}"),
-                     recommendation="Page blocked or not HTML. Consider allow-listing our scanner IP or enable browser fallback.")], err or f"HTTP {status}"
-    return analyze_html(url, html), None
+                     recommendation="If persistent, enable PLAYWRIGHT=1 or request IP allow-listing.")], err or f"HTTP {status}", method_used
+    return analyze_html(url, html), None, method_used
 
 # -----------------------------
-# Async batch with per-host rate limit
+# Async batch with per-host rate limit (HTTP/1.1 to avoid h2 lib issues)
 # -----------------------------
 async def _fetch_async(client: httpx.AsyncClient, url: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     try:
@@ -428,7 +448,7 @@ async def _audit_one_async(client: httpx.AsyncClient, url: str) -> List[Dict[str
                      snippet="Empty URL.", recommendation="Provide a valid URL.")]
     html, err, status = await _fetch_async(client, url_norm)
     if err or not html:
-        # Optional browser fallback per-URL inside batch would be expensive; keep to sync path for now.
+        # Note: keeping Playwright only in sync path to limit overhead
         return [dict(url=url_norm, check="Fetch failed", severity="HIGH", tag="-",
                      snippet=str(err or f"HTTP {status}"),
                      recommendation="If persistent, enable PLAYWRIGHT=1 or request IP allow-listing.")]
@@ -439,11 +459,9 @@ async def _audit_batch_async(urls: List[str], progress_cb: Callable[[int,int,str
     timeout = httpx.Timeout(DEFAULT_TIMEOUT)
     results: List[Dict[str,str]] = []
 
-    # http2=False to avoid missing 'h2' ImportError on some hosts
     async with httpx.AsyncClient(http2=False, headers=GENERIC_HEADERS, limits=limits, timeout=timeout, follow_redirects=True) as client:
         total = len(urls)
         idx = 0
-        # simple per-host token bucket
         next_ok: Dict[str, float] = {}
 
         async def worker(u: str):
@@ -558,7 +576,7 @@ def df_to_html_bytes(df: pd.DataFrame, title: str, branding: Dict) -> bytes:
 # Session storage
 # -----------------------------
 if "results" not in st.session_state: st.session_state["results"] = []
-if "last_run_meta" not in st.session_state: st.session_state["last_run_meta"] = {}
+if "last_run_meta" not in st.session_state: st.session_state["last_run_meta"] = []
 
 # -----------------------------
 # SCAN TAB
@@ -574,8 +592,7 @@ with scan_tab:
             RATE_LIMIT_PER_HOST = float(rlp)
             st.caption(f"Per-host rate limit set to {RATE_LIMIT_PER_HOST:.1f}s")
 
-        st.toggle("Playwright fallback enabled", value=PLAYWRIGHT_ENABLED, key="pw_toggled", disabled=True)
-        st.caption("To enable, start the app with environment variable PLAYWRIGHT=1")
+        st.caption(f"Playwright import: {'OK' if PW_OK else 'missing'} · PLAYWRIGHT env: {PLAYWRIGHT_ENV}")
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Run Audit")
@@ -601,10 +618,13 @@ with scan_tab:
 
     if run_single:
         st.info("Scanning…")
-        issues, _err = audit_url(url)
+        issues, _err, method_used = audit_url(url)
+        # annotate method in snippet if fetch succeeded
+        if _err is None:
+            for it in issues: it.setdefault("tag","-")
         st.session_state["results"] = issues
-        st.session_state["last_run_meta"] = {"urls":[normalize_url(url)], "ts": dt.datetime.utcnow().isoformat()}
-        st.success(f"Done. Found {len(issues)} issue(s). See the Results tab.")
+        st.session_state["last_run_meta"] = {"urls":[normalize_url(url)], "ts": dt.datetime.utcnow().isoformat(), "method": method_used}
+        st.success(f"Done via {method_used or '-'} — found {len(issues)} issue(s). See the Results tab.")
 
     if run_batch and batch_text.strip():
         urls = [normalize_url(u) for u in batch_text.splitlines() if u.strip()]
@@ -616,7 +636,7 @@ with scan_tab:
             n = min(len(urls), int(max_n))
             results = run_batch_concurrent(urls[:n], prog, status_area)
             st.session_state["results"] = results
-            st.session_state["last_run_meta"] = {"urls": urls[:n], "ts": dt.datetime.utcnow().isoformat()}
+            st.session_state["last_run_meta"] = {"urls": urls[:n], "ts": dt.datetime.utcnow().isoformat(), "suite": "batch"}
             cts = summarize(results_to_df(results))
             st.success(f"Batch complete — {cts['TOTAL']} issues across {cts['URLS']} page(s). See the Results tab.")
 
@@ -660,9 +680,11 @@ with results_tab:
         st.download_button("⬇️ JSON", data=df_to_json_bytes(df), file_name=f"{base}.json", mime="application/json", use_container_width=True)
         st.download_button("⬇️ HTML", data=df_to_html_bytes(df, title=f"{APP_NAME} — Report", branding=BRAND),
                            file_name=f"{base}.html", mime="text/html", use_container_width=True)
-        try: json.dump({"meta": st.session_state.get("last_run_meta", {}), "rows": st.session_state["results"]},
-                       open(os.path.join(EXPORTS_DIR, f"{base}.saved.json"), "w"), ensure_ascii=False, indent=2)
-        except Exception as e: st.caption(f"Could not save server copy: {e}")
+        try:
+            with open(os.path.join(EXPORTS_DIR, f"{base}.saved.json"), "w", encoding="utf-8") as f:
+                json.dump({"meta": st.session_state.get("last_run_meta", {}), "rows": st.session_state["results"]}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            st.caption(f"Could not save server copy: {e}")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # -----------------------------
@@ -708,10 +730,14 @@ with smoke_tab:
             status.write(f"Testing {i}/{total}: {name} — {url}")
             candidates = [url] + (SMOKE_ALTERNATIVES.get(url, []) if expect=="ok" else [])
             used = url; used_alt = False; issues: List[Dict[str,str]] = []; err = None; passed = False
-            for candidate in candidates:
-                issues, err = audit_url(candidate)
-                if (expect=="ok" and err is None) or (expect!="ok" and _smoke_expectation_passed(err, issues, expect)):
-                    used = candidate; used_alt = (candidate != url); passed = True; break
+            issues, err, method_used = audit_url(url)  # try primary first with full pipeline
+            if (expect=="ok" and err is None) or (expect!="ok" and _smoke_expectation_passed(err, issues, expect)):
+                used = url; passed = True
+            else:
+                for candidate in candidates[1:]:
+                    issues, err, method_used = audit_url(candidate)
+                    if (expect=="ok" and err is None) or (expect!="ok" and _smoke_expectation_passed(err, issues, expect)):
+                        used = candidate; used_alt = True; passed = True; break
             rows.append({"name":name,"url":url,"resolved_url":used,"expected":expect,
                          "passed":"✅ (alt)" if (passed and used_alt) else ("✅" if passed else "❌"),
                          "issues_found":len(issues),"error":err or ""})
