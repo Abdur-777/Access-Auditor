@@ -1,4 +1,4 @@
-# app.py — Accessibility Auditor (polite fetch + Playwright fallback + Robust Batch + WCAG analytics)
+# app.py — Accessibility Auditor (polite fetch + Playwright fallback + Robust Batch + WCAG Export)
 # Run: PLAYWRIGHT=1 python3 -m streamlit run app.py
 from __future__ import annotations
 
@@ -129,6 +129,8 @@ html, body, .stApp {{ background: {bg}; color: {text}; }}
 .stButton > button, .stDownloadButton > button {{ background:var(--wy-primary); color:#fff; border:none; border-radius:999px; padding:8px 14px; font-weight:700; }}
 .small, .stCaption, .stMarkdown p small {{ color:{muted}; }}
 .badge-dot {{ display:inline-block; width:10px; height:10px; border-radius:50%; vertical-align:middle; margin-right:6px; }}
+.fixfirst {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:12px; padding:12px 14px; }}
+.kpi {{ font-weight:800; }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -194,38 +196,6 @@ def _is_html(ct: str) -> bool:
 def _host_root(url: str) -> str:
     p = urlparse(url)
     return f"{p.scheme}://{p.netloc}/"
-
-# --- WCAG 2.2 mapping (SC → Level) ------------------------------------------
-# Keep labels short so they render nicely.
-WCAG_MAP = {
-    "Missing <title>":                    ("2.4.2", "A",  "Page Titled"),
-    "Missing language":                   ("3.1.1", "A",  "Language of Page"),
-    "Image missing alt text":             ("1.1.1", "A",  "Non-text Content"),
-    "Form control without label":         ("3.3.2", "A",  "Labels or Instructions"),
-    "Heading level jump":                 ("2.4.6", "AA", "Headings and Labels"),
-    "Table without headers":              ("1.3.1", "A",  "Info and Relationships"),
-    "Non-descriptive link text":          ("2.4.4", "A",  "Link Purpose (In Context)"),
-    "Low color contrast":                 ("1.4.3", "AA", "Contrast (Minimum)"),
-    # New checks below:
-    "Missing skip link":                  ("2.4.1", "A",  "Bypass Blocks"),
-    "Missing <main> landmark":            ("2.4.1", "A",  "Bypass Blocks"),
-    "Empty heading":                      ("2.4.6", "AA", "Headings and Labels"),
-    "Control without accessible name":    ("4.1.2", "A",  "Name, Role, Value"),
-    "File download (PDF/Doc) – ensure accessible": ("1.3.1", "A", "Info and Relationships"),
-    "Positive tabindex":                  ("2.4.3", "A",  "Focus Order"),
-    "Possible small interactive target":  ("2.5.8", "AA", "Target Size (Minimum)"),
-}
-
-def add_issue(issues: List[Dict[str, str]], *, url: str, check: str, severity: str,
-              tag: str, snippet: str, recommendation: str) -> None:
-    """Append an issue and enrich with WCAG SC/Level if mapped."""
-    row = dict(url=url, check=check, severity=severity, tag=tag,
-               snippet=snippet, recommendation=recommendation)
-    if check in WCAG_MAP:
-        sc, level, name = WCAG_MAP[check]
-        row["wcag_sc"] = f"{sc} {name}"
-        row["wcag_level"] = level
-    issues.append(row)
 
 # --------- Browser fallback (Playwright) ----------
 def fetch_via_browser(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Optional[str], Optional[int]]:
@@ -305,6 +275,28 @@ def fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Opti
 
     return None, (err_pw or last_err or "Fetch failed"), last_status, method_used
 
+# -----------------------------
+# WCAG helpers (tag every issue)
+# -----------------------------
+def wcag(tag_name: str) -> Tuple[str, str]:
+    """
+    Return (level, success_criterion) for a check name.
+    Keep this mapping short & pragmatic for a pre-check.
+    """
+    mapping = {
+        "Missing <title>": ("A", "2.4.2 Page Titled"),
+        "Missing language": ("A", "3.1.1 Language of Page"),
+        "Image missing alt text": ("A", "1.1.1 Non-text Content"),
+        "Form control without label": ("A", "3.3.2 Labels or Instructions"),
+        "Heading level jump": ("A", "1.3.1 Info and Relationships"),
+        "Table without headers": ("A", "1.3.1 Info and Relationships"),
+        "Non-descriptive link text": ("A", "2.4.4 Link Purpose (In Context)"),
+        "Low color contrast": ("AA", "1.4.3 Contrast (Minimum)"),
+        "File download (PDF/Doc) – ensure accessible": ("A", "1.3.1 Info and Relationships"),
+        "Fetch failed": ("A", "—"),
+    }
+    return mapping.get(tag_name, ("A", "—"))
+
 # --------- HTML analysis ----------
 def get_text_snippet(tag: Tag, max_len: int = 140) -> str:
     txt = tag.get_text(" ", strip=True) if isinstance(tag, Tag) else ""
@@ -348,164 +340,144 @@ def inline_style_dict(style: str) -> Dict[str,str]:
 
 GENERIC_LINK_TEXT = {"click here","read more","more","learn more","here"}
 
+DOC_EXTS = (".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx")
+
 def analyze_html(url: str, html: str) -> List[Dict[str,str]]:
     soup = BeautifulSoup(html, "html.parser")
     issues: List[Dict[str,str]] = []
 
-    # Existing checks (kept as-is; WCAG tags added later)
+    # 1) <title>
     if not soup.title or not soup.title.string or not soup.title.string.strip():
+        level, sc = wcag("Missing <title>")
         issues.append(dict(url=url, check="Missing <title>", severity="MED", tag="title",
-                           snippet="", recommendation="Add a descriptive <title>."))
+                           snippet="", recommendation="Add a descriptive <title> for the page.",
+                           wcag_level=level, wcag_sc=sc))
 
+    # 2) <html lang="">
     html_tag = soup.find("html")
     lang = (html_tag.get("lang") or "").strip().lower() if html_tag else ""
     if not lang:
+        level, sc = wcag("Missing language")
         issues.append(dict(url=url, check="Missing language", severity="MED", tag="html",
-                           snippet="", recommendation="Set <html lang='en'> (or appropriate)."))
+                           snippet="", recommendation="Set <html lang='en'> (or appropriate).",
+                           wcag_level=level, wcag_sc=sc))
 
+    # 3) Images need alt
     for img in soup.find_all("img"):
         alt = img.get("alt"); role = img.get("role")
-        if role == "presentation": continue
-        if alt is None or alt.strip()=="":
-            issues.append(dict(url=url, check="Image missing alt text", severity="HIGH",
-                               tag="img", snippet=(img.get("src") or "")[:140],
-                               recommendation="Add alt or mark decorative via role='presentation'."))
+        if role == "presentation":
+            continue
+        if alt is None or alt.strip() == "":
+            level, sc = wcag("Image missing alt text")
+            issues.append(dict(
+                url=url, check="Image missing alt text", severity="HIGH",
+                tag=str(img.name), snippet=(img.get("src") or "")[:140],
+                recommendation="Provide meaningful alt text or mark as decorative with role='presentation'.",
+                wcag_level=level, wcag_sc=sc
+            ))
 
-    for el in soup.find_all(["input","select","textarea"]):
-        if el.name=="input" and (el.get("type") or "").lower()=="hidden": continue
-        has_label = bool(el.get("aria-label") or el.get("aria-labelledby"))
+    # 4) Form controls need accessible name
+    form_controls = soup.find_all(["input","select","textarea"])
+    for el in form_controls:
+        if el.name == "input" and (el.get("type") or "").lower() == "hidden":
+            continue
+        has_label = False
+        if el.get("aria-label") or el.get("aria-labelledby"):
+            has_label = True
         el_id = el.get("id")
         if el_id:
             lbl = soup.find("label", attrs={"for": el_id})
-            if lbl and lbl.get_text(strip=True): has_label = True
+            if lbl and lbl.get_text(strip=True):
+                has_label = True
         if not has_label:
             parent = el.parent
             while isinstance(parent, Tag):
-                if parent.name=="label" and parent.get_text(strip=True): has_label=True; break
+                if parent.name == "label" and parent.get_text(strip=True):
+                    has_label = True; break
                 parent = parent.parent
         if not has_label:
-            issues.append(dict(url=url, check="Form control without label", severity="HIGH",
-                               tag=el.name, snippet=get_text_snippet(el),
-                               recommendation="Use <label for>, aria-label, or aria-labelledby."))
+            level, sc = wcag("Form control without label")
+            issues.append(dict(
+                url=url, check="Form control without label", severity="HIGH",
+                tag=el.name, snippet=get_text_snippet(el),
+                recommendation="Use <label for='id'>, aria-label, or aria-labelledby to name the control.",
+                wcag_level=level, wcag_sc=sc
+            ))
 
+    # 5) Heading order (avoid large jumps)
     heading_levels = []
     for h in soup.find_all(re.compile(r"^h[1-6]$")):
-        try: heading_levels.append((int(h.name[1]), get_text_snippet(h)))
-        except: pass
-    for i in range(1,len(heading_levels)):
-        prev,_ = heading_levels[i-1]; curr,snip = heading_levels[i]
+        try:
+            leveln = int(h.name[1]); heading_levels.append((leveln, get_text_snippet(h)))
+        except Exception:
+            pass
+    for i in range(1, len(heading_levels)):
+        prev,_ = heading_levels[i-1]
+        curr,snippet = heading_levels[i]
         if curr - prev > 1:
-            issues.append(dict(url=url, check="Heading level jump", severity="LOW",
-                               tag=f"h{curr}", snippet=snip,
-                               recommendation="Don’t skip heading levels."))
+            level, sc = wcag("Heading level jump")
+            issues.append(dict(
+                url=url, check="Heading level jump", severity="LOW",
+                tag=f"h{curr}", snippet=snippet,
+                recommendation="Avoid skipping heading levels; maintain hierarchical structure.",
+                wcag_level=level, wcag_sc=sc
+            ))
 
+    # 6) Tables: ensure header cells
     for tbl in soup.find_all("table"):
         if not tbl.find("th"):
-            issues.append(dict(url=url, check="Table without headers", severity="MED",
-                               tag="table", snippet=get_text_snippet(tbl),
-                               recommendation="Use <th> with proper scope."))
+            level, sc = wcag("Table without headers")
+            issues.append(dict(
+                url=url, check="Table without headers", severity="MED",
+                tag="table", snippet=get_text_snippet(tbl),
+                recommendation="Use <th> for header cells and scope='col/row' where appropriate.",
+                wcag_level=level, wcag_sc=sc
+            ))
 
+    # 7) Links with poor text
     for a in soup.find_all("a"):
-        txt_a = (a.get_text(" ", strip=True) or "").lower()
-        if not txt_a or txt_a in GENERIC_LINK_TEXT:
-            issues.append(dict(url=url, check="Non-descriptive link text", severity="LOW",
-                               tag="a", snippet=get_text_snippet(a),
-                               recommendation="Use meaningful link text."))
+        txt = (a.get_text(" ", strip=True) or "").lower()
+        if not txt or txt in GENERIC_LINK_TEXT:
+            level, sc = wcag("Non-descriptive link text")
+            issues.append(dict(
+                url=url, check="Non-descriptive link text", severity="LOW",
+                tag="a", snippet=get_text_snippet(a),
+                recommendation="Use meaningful link text describing the destination.",
+                wcag_level=level, wcag_sc=sc
+            ))
 
+    # 8) Basic color contrast for inline-styled text
     for el in soup.find_all(True):
         style = inline_style_dict(el.get("style") or "")
         if not style: continue
-        fg = parse_color(style.get("color","")); bg = parse_color(style.get("background-color",""))
+        fg = parse_color(style.get("color", ""))
+        bg = parse_color(style.get("background-color", ""))
         if fg and bg:
-            ratio = contrast_ratio(fg,bg)
-            fs = px_value(style.get("font-size","") or ""); weight = (style.get("font-weight","") or "400")
-            large = (fs and fs>=18.0) or ((fs and fs>=14.0) and (weight.isdigit() and int(weight)>=700))
+            ratio = contrast_ratio(fg, bg)
+            fs = px_value(style.get("font-size","") or "")
+            weight = (style.get("font-weight","") or "400")
+            large = (fs and fs >= 18.0) or ((fs and fs >= 14.0) and (weight.isdigit() and int(weight) >= 700))
             threshold = 3.0 if large else 4.5
             if ratio < threshold:
-                issues.append(dict(url=url, check="Low color contrast", severity="HIGH",
-                                   tag=el.name, snippet=get_text_snippet(el),
-                                   recommendation=f"Increase contrast (ratio {ratio:.2f} < {threshold:.1f})."))
+                level, sc = wcag("Low color contrast")
+                issues.append(dict(
+                    url=url, check="Low color contrast", severity="HIGH",
+                    tag=el.name, snippet=get_text_snippet(el),
+                    recommendation=f"Increase contrast (ratio {ratio:.2f} < {threshold:.1f}); adjust text or background.",
+                    wcag_level=level, wcag_sc=sc
+                ))
 
-    # --- NEW: simple WCAG-aligned checks -------------------------------------
-
-    # Convenience locals
-    def _txt(x: Tag) -> str: return (x.get_text(" ", strip=True) if isinstance(x, Tag) else "")
-    def _has_role(el: Tag, r: str) -> bool: return (el.get("role") or "").strip().lower() == r
-
-    # 2.4.1 Bypass Blocks — Skip link
-    skip_found = any(
-        (a.get("href") or "").startswith("#") and "skip" in _txt(a).lower()
-        for a in soup.find_all("a")
-    )
-    if not skip_found:
-        add_issue(issues, url=url, check="Missing skip link", severity="MED",
-                  tag="a", snippet="", recommendation="Add a visible 'Skip to main content' link to bypass repeated blocks.")
-
-    # 2.4.1 Bypass Blocks — <main> landmark
-    has_main = bool(soup.find("main") or soup.find(attrs={"role": "main"}))
-    if not has_main:
-        add_issue(issues, url=url, check="Missing <main> landmark", severity="MED",
-                  tag="main", snippet="", recommendation="Wrap primary content in <main> (or role='main').")
-
-    # 2.4.6 Headings and Labels — Empty headings
-    for h in soup.find_all(re.compile(r"^h[1-6]$")):
-        if not _txt(h):
-            add_issue(issues, url=url, check="Empty heading", severity="LOW",
-                      tag=h.name, snippet=str(h)[:120],
-                      recommendation="Remove empty heading elements or provide meaningful text.")
-
-    # 4.1.2 Name, Role, Value — Controls without accessible name
-    for b in soup.find_all("button"):
-        if not (_txt(b) or b.get("aria-label") or b.get("aria-labelledby")):
-            add_issue(issues, url=url, check="Control without accessible name", severity="HIGH",
-                      tag="button", snippet=str(b)[:120],
-                      recommendation="Add visible text, aria-label, or aria-labelledby.")
-    for a in soup.find_all("a"):
-        if _has_role(a, "button") and not (_txt(a) or a.get("aria-label") or a.get("aria-labelledby")):
-            add_issue(issues, url=url, check="Control without accessible name", severity="HIGH",
-                      tag="a[role=button]", snippet=str(a)[:120],
-                      recommendation="Provide accessible name via text or aria-label/aria-labelledby.")
-
-    # 1.3.1 Info & Relationships — File links (PDF/Doc)
+    # 9) File download links (PDF/Doc) → nudge for accessible alternative/tagging
     for a in soup.find_all("a", href=True):
-        href = a["href"].lower()
-        if any(href.endswith(ext) for ext in (".pdf", ".doc", ".docx", ".ppt", ".pptx")):
-            add_issue(issues, url=url, check="File download (PDF/Doc) – ensure accessible", severity="LOW",
-                      tag="a", snippet=href[:140],
-                      recommendation="Provide an accessible HTML alternative or ensure the document is fully tagged/accessible.")
-
-    # 2.4.3 Focus Order — positive tabindex
-    for el in soup.find_all(attrs={"tabindex": True}):
-        try:
-            ti = int(str(el.get("tabindex")).strip())
-            if ti > 0:
-                add_issue(issues, url=url, check="Positive tabindex", severity="LOW",
-                          tag=el.name, snippet=str(el)[:120],
-                          recommendation="Avoid tabindex > 0. Use natural DOM order and tabindex='0' where needed.")
-        except Exception:
-            pass
-
-    # 2.5.8 Target Size (Minimum) — heuristic for small inline-styled targets
-    def _px_num(v: Optional[str]) -> Optional[float]:
-        m = re.search(r"([0-9.]+)\s*px", v or "", flags=re.I)
-        return float(m.group(1)) if m else None
-
-    for el in soup.find_all(["a", "button"]):
-        st_inline = inline_style_dict(el.get("style") or "")
-        w = _px_num(st_inline.get("width")); h = _px_num(st_inline.get("height"))
-        fs = _px_num(st_inline.get("font-size"))
-        looks_small = (w and w < 24) or (h and h < 24) or (fs and fs < 12)
-        if looks_small:
-            add_issue(issues, url=url, check="Possible small interactive target", severity="LOW",
-                      tag=el.name, snippet=_txt(el)[:120],
-                      recommendation="Ensure target size ≥24×24 CSS px, or meet spacing exceptions (WCAG 2.2 – 2.5.8).")
-
-    # Add WCAG SC/Level to any earlier issues that match known checks
-    for it in issues:
-        if "wcag_sc" not in it and it.get("check") in WCAG_MAP:
-            sc, level, name = WCAG_MAP[it["check"]]
-            it["wcag_sc"] = f"{sc} {name}"
-            it["wcag_level"] = level
+        href = a["href"].split("?")[0].split("#")[0].strip().lower()
+        if any(href.endswith(ext) for ext in DOC_EXTS):
+            level, sc = wcag("File download (PDF/Doc) – ensure accessible")
+            issues.append(dict(
+                url=url, check="File download (PDF/Doc) – ensure accessible", severity="LOW",
+                tag="a", snippet=href,
+                recommendation="Provide an accessible HTML alternative or ensure the document is fully tagged and accessible.",
+                wcag_level=level, wcag_sc=sc
+            ))
 
     return issues
 
@@ -517,9 +489,11 @@ def audit_url(url: str) -> Tuple[List[Dict[str,str]], Optional[str], str]:
     if not url: return [], "Empty URL.", "-"
     html, err, status, method_used = fetch(url)
     if err or not html:
+        level, sc = wcag("Fetch failed")
         return [dict(url=url, check="Fetch failed", severity="HIGH", tag="-",
                      snippet=str(err or f"HTTP {status}"),
-                     recommendation="If persistent, enable PLAYWRIGHT=1 or request IP allow-listing.")], err or f"HTTP {status}", method_used
+                     recommendation="If persistent, enable PLAYWRIGHT=1 or request IP allow-listing.",
+                     wcag_level=level, wcag_sc=sc)], err or f"HTTP {status}", method_used
     return analyze_html(url, html), None, method_used
 
 # -----------------------------
@@ -558,9 +532,11 @@ async def _fetch_async(client: httpx.AsyncClient, url: str) -> Tuple[Optional[st
 async def _audit_one_async(client: httpx.AsyncClient, url: str) -> List[Dict[str, str]]:
     url_norm = normalize_url(url)
     if not url_norm:
+        level, sc = wcag("Fetch failed")
         return [dict(
             url=url, check="Fetch failed", severity="HIGH", tag="-",
-            snippet="Empty URL.", recommendation="Provide a valid URL (https://…)."
+            snippet="Empty URL.", recommendation="Provide a valid URL (https://…).",
+            wcag_level=level, wcag_sc=sc
         )]
 
     # Fast path: try async httpx first
@@ -615,6 +591,45 @@ def run_batch_concurrent(urls: List[str], prog, status_area) -> List[Dict[str, s
         finally:
             loop.close()
 
+# ---------- Helpers to make the export irresistible ----------
+def _shorten_snippet(s: str, max_len: int = 60) -> str:
+    """Return a short, human-friendly snippet (filename or last segment)."""
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    try:
+        p = urlparse(s)
+        if p.path:
+            base = p.path.rstrip("/").split("/")[-1] or p.netloc
+        else:
+            base = s
+    except Exception:
+        base = s
+    if not base or base == "/":
+        base = s.split("/")[-1]
+    if len(base) > max_len:
+        base = base[: max_len - 1] + "…"
+    return base
+
+def _counts(df: pd.DataFrame, check_name: str) -> int:
+    if df.empty or "check" not in df.columns:
+        return 0
+    return int((df["check"] == check_name).sum())
+
+def _wcag_level_count(df: pd.DataFrame, level: str) -> int:
+    if df.empty or "wcag_level" not in df.columns:
+        return 0
+    return int((df["wcag_level"] == level).sum())
+
+def _top_pages_by_high(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["url","HIGH"])
+    x = df[df["severity"].str.upper() == "HIGH"]
+    if x.empty:
+        return pd.DataFrame(columns=["url","HIGH"])
+    g = x.groupby("url").size().reset_index(name="HIGH").sort_values("HIGH", ascending=False)
+    return g.head(n)
+
 # -----------------------------
 # Data shaping & export
 # -----------------------------
@@ -626,6 +641,11 @@ def results_to_df(results: List[Dict[str,str]]) -> pd.DataFrame:
     cols = ["url","severity","wcag_level","wcag_sc","check","tag","snippet","recommendation"]
     cols = [c for c in cols if c in df.columns]
     df = df[cols]
+
+    # Make snippets readable (filenames instead of long paths)
+    if "snippet" in df.columns:
+        df["snippet"] = df["snippet"].apply(_shorten_snippet)
+
     sev_order = {"HIGH":0,"MED":1,"LOW":2}
     df["sev_rank"] = df["severity"].map(lambda s: sev_order.get(str(s).upper(), 9))
     df = df.sort_values(["sev_rank","url","check"]).drop(columns=["sev_rank"])
@@ -643,35 +663,56 @@ def df_to_json_bytes(df: pd.DataFrame) -> bytes: return df.to_json(orient="recor
 
 def df_to_html_bytes(df: pd.DataFrame, title: str, branding: Dict) -> bytes:
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
     pages = int(df["url"].nunique()) if (not df.empty and "url" in df.columns) else 0
     total = int(len(df))
     high = int((df["severity"].str.upper() == "HIGH").sum()) if "severity" in df.columns else 0
     med  = int((df["severity"].str.upper() == "MED").sum())  if "severity" in df.columns else 0
     low  = int((df["severity"].str.upper() == "LOW").sum())  if "severity" in df.columns else 0
 
+    # Fix-first signals
+    n_labels   = _counts(df, "Form control without label")                  # 3.3.2 A
+    n_alt      = _counts(df, "Image missing alt text")                      # 1.1.1 A
+    n_pdfs     = _counts(df, "File download (PDF/Doc) – ensure accessible") # 1.3.1 A
+    n_contrast = _counts(df, "Low color contrast")                          # 1.4.3 AA
+    wcag_a  = _wcag_level_count(df, "A")
+    wcag_aa = _wcag_level_count(df, "AA")
+
+    # Top pages by HIGH issues
+    top_pages = _top_pages_by_high(df, 10)
+
+    # Export copy of table (keep WCAG cols if present)
     df2 = df.copy()
-    # Friendlier label
     if "check" in df2.columns:
         df2["check"] = df2["check"].replace({"Fetch failed": "Page not available (blocked/timeout/non-HTML)"})
-    # Keep WCAG columns if present and order columns nicely
     export_cols = [c for c in ["url","severity","wcag_level","wcag_sc","check","tag","snippet","recommendation"] if c in df2.columns]
     if export_cols:
         df2 = df2[export_cols]
-    # Clickable links + severity badges
     if "url" in df2.columns:
         df2["url"] = df2["url"].apply(lambda u: f"<a href='{u}' target='_blank' rel='noopener noreferrer'>{u}</a>")
     if "severity" in df2.columns:
         df2["severity"] = df2["severity"].apply(lambda s: f"<span class='badge {s}'>{s}</span>")
     html_table = df2.to_html(escape=False, index=False)
 
+    # Top pages mini-table
+    if not top_pages.empty:
+        tp = top_pages.copy()
+        tp["url"] = tp["url"].apply(lambda u: f"<a href='{u}' target='_blank' rel='noopener noreferrer'>{u}</a>")
+        html_top = tp.to_html(escape=False, index=False)
+    else:
+        html_top = "<p class='muted'>No HIGH-severity issues found.</p>"
+
     css = f"""
     <style>
       body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin:24px; }}
       h1 {{ color:{branding['primary']}; margin-bottom: 6px; }}
+      h2 {{ margin: 16px 0 8px 0; }}
       a {{ color:{branding['primary']}; text-decoration:none; }}
       a:hover {{ text-decoration:underline; }}
       .summary-top {{ margin: 6px 0 16px 0; font-weight:600; color:#334155; }}
       .generated {{ margin: 4px 0 16px 0; color:#64748b; font-size:12px; }}
+      .fixfirst {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:12px; padding:12px 14px; }}
+      .fixfirst strong {{ color:#0b1220; }}
       table {{ border-collapse: collapse; width: 100%; }}
       th, td {{ text-align: left; padding: 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }}
       th {{ background:#f8fafc; }}
@@ -682,19 +723,56 @@ def df_to_html_bytes(df: pd.DataFrame, title: str, branding: Dict) -> bytes:
       .muted {{ color:#64748b; font-size:12px; }}
       .brand {{ font-weight:800;font-size:18px;color:{branding['primary']}; vertical-align:middle; }}
       .brand img {{ height:44px;vertical-align:middle;margin-right:10px; }}
-    </style>"""
-    summary_html = (f"<div class='summary-top'><strong>{pages}</strong> page(s) • {total} issue(s) "
-                    f"(<span class='badge HIGH'>HIGH {high}</span> "
-                    f"<span class='badge MED'>MED {med}</span> "
-                    f"<span class='badge LOW'>LOW {low}</span>)</div>")
-    html = f"""<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>{css}</head>
+      ul.metrics {{ margin:8px 0 0 20px; }}
+      ul.metrics li {{ margin:2px 0; }}
+      .kpi {{ font-weight:800; }}
+    </style>
+    """
+
+    summary_html = (
+        f"<div class='summary-top'>"
+        f"<strong>{pages}</strong> page(s) • "
+        f"{total} issue(s) "
+        f"(<span class='badge HIGH'>HIGH {high}</span> "
+        f"<span class='badge MED'>MED {med}</span> "
+        f"<span class='badge LOW'>LOW {low}</span>)"
+        f"</div>"
+    )
+
+    # ⭐ Fix-first panel
+    fixfirst_html = f"""
+    <div class="fixfirst">
+      <div class="kpi">WCAG levels flagged: A {wcag_a} · AA {wcag_aa}</div>
+      <ul class="metrics">
+        <li><strong>{n_labels}</strong> form controls without labels — <em>3.3.2 A</em> (screen readers & cognitive load)</li>
+        <li><strong>{n_alt}</strong> images missing alt text — <em>1.1.1 A</em> (non-text content)</li>
+        <li><strong>{n_contrast}</strong> low-contrast text — <em>1.4.3 AA</em> (low vision)</li>
+        <li><strong>{n_pdfs}</strong> PDF/Doc links to review — <em>1.3.1 A</em> (HTML alternative or fully tagged doc)</li>
+      </ul>
+    </div>
+    """
+
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+      <title>{title}</title>{css}</head>
     <body>
-      <div class="brand"><img src="{branding['logo']}" alt="logo"/>{branding['name']}</div>
-      <h1>Accessibility Audit Report</h1>
+      <div class="brand">
+        <img src="{branding['logo']}" alt="logo"/>{branding['name']}
+      </div>
+
+      <h1>Accessibility Audit Report (Automated WCAG 2.2 Pre-check)</h1>
       <div class="generated">Generated: {now}</div>
       {summary_html}
+
+      <h2>Fix-first summary</h2>
+      {fixfirst_html}
+
+      <h2>Top pages by HIGH-severity issues</h2>
+      {html_top}
+
+      <h2>All findings</h2>
       {html_table}
-      <p class="muted">Automated WCAG pre-check. For blocked pages, request an IP allow-list or enable browser fallback.</p>
+
+      <p class="muted">Public pages only. Read-only capture with polite rate limits; a real headless browser is used if non-browser fetches are blocked. This is an automated pre-check; manual verification recommended for conformance.</p>
     </body></html>"""
     return html.encode("utf-8")
 
@@ -757,7 +835,6 @@ with scan_tab:
         if not urls:
             st.warning("No valid URLs provided.")
         else:
-            # NEW: robust toggle – guaranteed Playwright fallback per URL (slower)
             robust = st.checkbox("Use robust (browser) fallback in batch (slower, fewer 403s)",
                                  value=True, key="batch_robust")
 
@@ -792,37 +869,51 @@ with scan_tab:
             st.success(f"Batch complete — {cts['TOTAL']} issues across {cts['URLS']} page(s). See the Results tab.")
 
 # -----------------------------
-# RESULTS TAB
+# RESULTS TAB (now with Fix-first panel)
 # -----------------------------
 with results_tab:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Summary")
     df = results_to_df(st.session_state.get("results", []))
     cts = summarize(df)
+
+    # Fix-first counters
+    n_labels   = _counts(df, "Form control without label")
+    n_alt      = _counts(df, "Image missing alt text")
+    n_pdfs     = _counts(df, "File download (PDF/Doc) – ensure accessible")
+    n_contrast = _counts(df, "Low color contrast")
+    wcag_a  = _wcag_level_count(df, "A")
+    wcag_aa = _wcag_level_count(df, "AA")
+
     c1,c2,c3,c4,c5 = st.columns(5)
     c1.metric("HIGH", cts["HIGH"]); c2.metric("MED", cts["MED"]); c3.metric("LOW", cts["LOW"])
     c4.metric("Total", cts["TOTAL"]); c5.metric("Pages", cts["URLS"])
 
-    # NEW: WCAG level counters
-    a_count = int((df["wcag_level"] == "A").sum()) if ("wcag_level" in df.columns and not df.empty) else 0
-    aa_count = int((df["wcag_level"] == "AA").sum()) if ("wcag_level" in df.columns and not df.empty) else 0
-    c6, c7 = st.columns(2)
-    with c6: st.metric("WCAG A", a_count)
-    with c7: st.metric("WCAG AA", aa_count)
+    # In-app Fix-first panel
+    st.markdown(
+        f"""
+        <div class="fixfirst">
+          <div class="kpi">WCAG levels flagged: A {wcag_a} · AA {wcag_aa}</div>
+          <ul class="metrics">
+            <li><strong>{n_labels}</strong> form controls without labels — <em>3.3.2 A</em></li>
+            <li><strong>{n_alt}</strong> images missing alt text — <em>1.1.1 A</em></li>
+            <li><strong>{n_contrast}</strong> low-contrast text — <em>1.4.3 AA</em></li>
+            <li><strong>{n_pdfs}</strong> PDF/Doc links to review — <em>1.3.1 A</em></li>
+          </ul>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # NEW: WCAG breakdown table
+    # Grouped view
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("WCAG breakdown")
-    if df.empty or "wcag_sc" not in df.columns:
-        st.caption("No WCAG mapping yet.")
+    st.subheader("Top pages by HIGH-severity issues")
+    if df.empty:
+        st.caption("No results yet.")
     else:
-        wcag_group = (
-            df.groupby(["wcag_level", "wcag_sc", "check"])
-              .size().reset_index(name="count")
-              .sort_values(["wcag_level", "count"], ascending=[True, False])
-        )
-        st.dataframe(wcag_group, use_container_width=True, hide_index=True)
+        top_pages_df = _top_pages_by_high(df, 10)
+        st.dataframe(top_pages_df, use_container_width=True, hide_index=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="card">', unsafe_allow_html=True)
