@@ -1,4 +1,4 @@
-# app.py — Accessibility Auditor (polite fetch + Playwright fallback)
+# app.py — Accessibility Auditor (polite fetch + Playwright fallback + Robust Batch)
 # Run: PLAYWRIGHT=1 python3 -m streamlit run app.py
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ PLAYWRIGHT_ENV = os.getenv("PLAYWRIGHT", "0")  # "1" to enable browser fallback
 RATE_LIMIT_PER_HOST = float(os.getenv("RATE_LIMIT_PER_HOST", "0.9"))  # seconds between hits to same host
 DEFAULT_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "22"))
 
-# Try importing Playwright up-front so we can display a clear diagnostic in the UI
+# Try importing Playwright (for diagnostics + fallback)
 try:
     from playwright.sync_api import sync_playwright  # type: ignore
     PW_OK = True
@@ -30,7 +30,7 @@ except Exception:
     PW_OK = False
 
 # -----------------------------
-# Preset smoke-test suite
+# Smoke test suite
 # -----------------------------
 SMOKE_CASES = [
     ("Council Melbourne", "https://www.melbourne.vic.gov.au/", "ok"),
@@ -138,7 +138,6 @@ with cols_head[1]:
     st.markdown(f"### {APP_NAME}")
     st.caption("Polite, cookie-aware fetcher with **real-browser fallback**.")
 with cols_head[2]:
-    # Diagnostics banner
     dot_color = "#16a34a" if (PW_OK and PLAYWRIGHT_ENV == "1") else "#ef4444"
     st.markdown(
         f"<div class='small'>"
@@ -206,7 +205,7 @@ def fetch_via_browser(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optiona
             ctx = browser.new_context(user_agent=random.choice(UA_POOL))
             page = ctx.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=timeout*1000)
-            page.wait_for_timeout(800)  # small settle time for light JS
+            page.wait_for_timeout(800)  # small settle
             html = page.content()
             ctx.close(); browser.close()
             return html, None, 200
@@ -216,8 +215,7 @@ def fetch_via_browser(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optiona
 # --------- 403-friendly SYNC fetch with warm-up, cookies, referer, http2 fallback, THEN Playwright ----------
 def fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Optional[str], Optional[int], str]:
     """
-    Returns (html, error, status, method_used)
-    method_used in {"requests","httpx","playwright","-"}
+    Returns (html, error, status, method_used) where method_used in {"requests","httpx","playwright","-"}
     """
     method_used = "-"
     s = _session_with_retries()
@@ -225,7 +223,7 @@ def fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Opti
     s.headers.update({"User-Agent": ua})
     url = normalize_url(url)
 
-    # Warm-up (root) to collect cookies
+    # Warm-up to collect cookies
     try: s.get(_host_root(url), timeout=timeout, allow_redirects=True)
     except requests.RequestException: pass
 
@@ -273,10 +271,9 @@ def fetch(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[Optional[str], Opti
         method_used = "playwright"
         return html_pw, None, st_pw or 200, method_used
 
-    # Give up
     return None, (err_pw or last_err or "Fetch failed"), last_status, method_used
 
-# --------- HTML analysis (WCAG quick checks) ----------
+# --------- HTML analysis ----------
 def get_text_snippet(tag: Tag, max_len: int = 140) -> str:
     txt = tag.get_text(" ", strip=True) if isinstance(tag, Tag) else ""
     txt = re.sub(r"\s+", " ", txt)
@@ -399,8 +396,7 @@ def analyze_html(url: str, html: str) -> List[Dict[str,str]]:
 
 def audit_url(url: str) -> Tuple[List[Dict[str,str]], Optional[str], str]:
     """
-    Returns (issues, error, method_used)
-    method_used mirrors fetch(): {"requests","httpx","playwright","-"}
+    Returns (issues, error, method_used) — method_used ∈ {"requests","httpx","playwright","-"}
     """
     url = normalize_url(url)
     if not url: return [], "Empty URL.", "-"
@@ -412,7 +408,7 @@ def audit_url(url: str) -> Tuple[List[Dict[str,str]], Optional[str], str]:
     return analyze_html(url, html), None, method_used
 
 # -----------------------------
-# Async batch with per-host rate limit (HTTP/1.1 to avoid h2 lib issues)
+# Async helpers
 # -----------------------------
 async def _fetch_async(client: httpx.AsyncClient, url: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     try:
@@ -441,18 +437,25 @@ async def _fetch_async(client: httpx.AsyncClient, url: str) -> Tuple[Optional[st
         comb = "; ".join([x for x in [first_err, second_err] if x]) or "403/401 Forbidden or blocked by anti-bot"
         return None, f"Fetch failed: {comb}", None
 
+# -----------------------------
+# Async worker (with sync/Playwright fallback)
+# -----------------------------
 async def _audit_one_async(client: httpx.AsyncClient, url: str) -> List[Dict[str, str]]:
     url_norm = normalize_url(url)
     if not url_norm:
-        return [dict(url=url, check="Fetch failed", severity="HIGH", tag="-",
-                     snippet="Empty URL.", recommendation="Provide a valid URL.")]
+        return [dict(
+            url=url, check="Fetch failed", severity="HIGH", tag="-",
+            snippet="Empty URL.", recommendation="Provide a valid URL (https://…)."
+        )]
+
+    # Fast path: try async httpx first
     html, err, status = await _fetch_async(client, url_norm)
-    if err or not html:
-        # Note: keeping Playwright only in sync path to limit overhead
-        return [dict(url=url_norm, check="Fetch failed", severity="HIGH", tag="-",
-                     snippet=str(err or f"HTTP {status}"),
-                     recommendation="If persistent, enable PLAYWRIGHT=1 or request IP allow-listing.")]
-    return analyze_html(url_norm, html)
+    if html and not err:
+        return analyze_html(url_norm, html)
+
+    # Fallback: run the SAME sync pipeline as Run Audit (includes Playwright if enabled)
+    items, _err2, _method2 = audit_url(url_norm)
+    return items
 
 async def _audit_batch_async(urls: List[str], progress_cb: Callable[[int,int,str], None]) -> List[Dict[str,str]]:
     limits = httpx.Limits(max_connections=12, max_keepalive_connections=6)
@@ -619,7 +622,6 @@ with scan_tab:
     if run_single:
         st.info("Scanning…")
         issues, _err, method_used = audit_url(url)
-        # annotate method in snippet if fetch succeeded
         if _err is None:
             for it in issues: it.setdefault("tag","-")
         st.session_state["results"] = issues
@@ -632,11 +634,37 @@ with scan_tab:
         if not urls:
             st.warning("No valid URLs provided.")
         else:
-            prog = st.progress(0); status_area = st.empty()
+            # NEW: robust toggle – guaranteed Playwright fallback per URL (slower)
+            robust = st.checkbox("Use robust (browser) fallback in batch (slower, fewer 403s)",
+                                 value=True, key="batch_robust")
+
             n = min(len(urls), int(max_n))
-            results = run_batch_concurrent(urls[:n], prog, status_area)
+            urls = urls[:n]
+            prog = st.progress(0)
+            status_area = st.empty()
+
+            if robust:
+                # Run the SAME sync pipeline as Run Audit for each URL
+                all_items: List[Dict[str, str]] = []
+                total = len(urls)
+                for i, u in enumerate(urls, start=1):
+                    status_area.write(f"Scanning {i}/{total}: {u}")
+                    items, _err, _method = audit_url(u)   # includes Playwright if enabled
+                    all_items.extend(items)
+                    prog.progress(int(i / total * 100))
+                results = all_items
+                suite_name = "batch-robust"
+            else:
+                # Keep the fast async path (now also falls back to sync if needed)
+                results = run_batch_concurrent(urls, prog, status_area)
+                suite_name = "batch-async"
+
             st.session_state["results"] = results
-            st.session_state["last_run_meta"] = {"urls": urls[:n], "ts": dt.datetime.utcnow().isoformat(), "suite": "batch"}
+            st.session_state["last_run_meta"] = {
+                "urls": urls,
+                "ts": dt.datetime.utcnow().isoformat(),
+                "suite": suite_name,
+            }
             cts = summarize(results_to_df(results))
             st.success(f"Batch complete — {cts['TOTAL']} issues across {cts['URLS']} page(s). See the Results tab.")
 
