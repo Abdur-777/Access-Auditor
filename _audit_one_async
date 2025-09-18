@@ -1,0 +1,20 @@
+# -----------------------------
+# Async worker (with sync/Playwright fallback)
+# -----------------------------
+async def _audit_one_async(client: httpx.AsyncClient, url: str) -> List[Dict[str, str]]:
+    url_norm = normalize_url(url)
+    if not url_norm:
+        return [dict(
+            url=url, check="Fetch failed", severity="HIGH", tag="-",
+            snippet="Empty URL.", recommendation="Provide a valid URL (https://…)."
+        )]
+
+    # Fast path: try async httpx first
+    html, err, status = await _fetch_async(client, url_norm)
+    if html and not err:
+        return analyze_html(url_norm, html)
+
+    # NEW: if async failed, run the sync pipeline (requests -> httpx -> Playwright)
+    # audit_url() already handles the full chain and returns issue rows
+    items, _err2, _method2 = audit_url(url_norm)
+    return items
