@@ -2,9 +2,9 @@
 # Run: streamlit run app.py
 
 from __future__ import annotations
-import os, re, json, tempfile, base64, datetime as dt, asyncio
+import os, re, io, json, time, tempfile, base64, datetime as dt, asyncio
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Callable
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -225,6 +225,7 @@ def normalize_url(u: str) -> str:
         u = "https://" + u
     return u
 
+# --- Sync fetch (single scan) ---
 def fetch(url: str, timeout: int = 20) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     """Fetch URL robustly with retries and a browser-like UA. Returns (html, error, status_code)."""
     http = _session_with_retries()
@@ -387,8 +388,7 @@ def analyze_html(url: str, html: str) -> List[Dict[str, str]]:
     # 8) Basic color contrast for inline-styled text
     for el in soup.find_all(True):
         style = inline_style_dict(el.get("style") or "")
-        if not style:
-            continue
+        if not style: continue
         fg = parse_color(style.get("color", ""))
         bg = parse_color(style.get("background-color", ""))
         if fg and bg:
@@ -418,6 +418,84 @@ def audit_url(url: str) -> Tuple[List[Dict[str,str]], Optional[str]]:
     issues = analyze_html(url, html)
     return issues, None
 
+# -----------------------------
+# ASYNC batch scanning (HTTP/1.1 only)
+# -----------------------------
+async def _fetch_async(client: httpx.AsyncClient, url: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    try:
+        r = await client.get(url)
+        ct = r.headers.get("Content-Type", "") or ""
+        if "text/html" not in ct and "application/xhtml+xml" not in ct:
+            return None, f"Unsupported content type: {ct}", r.status_code
+        r.raise_for_status()
+        return r.text, None, r.status_code
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code if e.response is not None else None
+        return None, str(e), status
+    except httpx.RequestError as e:
+        return None, str(e), None
+
+async def _audit_one_async(client: httpx.AsyncClient, url: str) -> List[Dict[str, str]]:
+    url_norm = normalize_url(url)
+    if not url_norm:
+        return [dict(url=url, check="Fetch failed", severity="HIGH", tag="-",
+                     snippet="Empty URL.", recommendation="Provide a valid URL (https://...).")]
+    html, err, status = await _fetch_async(client, url_norm)
+    if err or not html:
+        return [dict(
+            url=url_norm, check="Fetch failed", severity="HIGH", tag="-",
+            snippet=str(err or f"HTTP {status}"), recommendation="Verify URL and connectivity; ensure the page returns HTML."
+        )]
+    return analyze_html(url_norm, html)
+
+async def _audit_batch_async(urls: List[str], progress_cb: Callable[[int, int, str], None]) -> List[Dict[str, str]]:
+    limits = httpx.Limits(max_connections=12, max_keepalive_connections=6)
+    timeout = httpx.Timeout(20.0)
+    results: List[Dict[str, str]] = []
+
+    # IMPORTANT: http2=False (fixes your ImportError)
+    async with httpx.AsyncClient(
+        http2=False,
+        headers=GENERIC_HEADERS,
+        limits=limits,
+        timeout=timeout,
+        follow_redirects=True,
+    ) as client:
+        total = len(urls)
+        idx = 0
+
+        async def worker(u: str):
+            nonlocal idx, results
+            items = await _audit_one_async(client, u)
+            results.extend(items)
+            idx += 1
+            progress_cb(idx, total, u)
+
+        tasks = [worker(u) for u in urls]
+        await asyncio.gather(*tasks)
+
+    return results
+
+def run_batch_concurrent(urls: List[str], prog, status_area) -> List[Dict[str, str]]:
+    def _update_progress(done: int, total: int, current_url: str):
+        pct = int(done / max(total, 1) * 100)
+        status_area.write(f"Scanning {done}/{total}: {current_url}")
+        prog.progress(pct)
+
+    try:
+        return asyncio.run(_audit_batch_async(urls, _update_progress))
+    except RuntimeError:
+        # If an event loop is already running (rare in some Streamlit hosts)
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(_audit_batch_async(urls, _update_progress))
+        finally:
+            loop.close()
+
+# -----------------------------
+# Data shaping & export
+# -----------------------------
 def results_to_df(results: List[Dict[str,str]]) -> pd.DataFrame:
     if not results:
         return pd.DataFrame(columns=["url","severity","check","tag","snippet","recommendation"])
@@ -532,75 +610,6 @@ def df_to_html_bytes(df: pd.DataFrame, title: str, branding: Dict) -> bytes:
 # -------------------------------------------------------------------------------------
 
 # -----------------------------
-# Async batch scanning (fast)
-# -----------------------------
-MAX_CONCURRENCY = int(os.getenv("AA_MAX_CONCURRENCY", "10"))
-REQUEST_TIMEOUT = float(os.getenv("AA_TIMEOUT", "8.0"))
-RETRIES = int(os.getenv("AA_RETRIES", "2"))
-
-async def _afetch(client: httpx.AsyncClient, url: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-    """Async fetch with retries/backoff. Returns (html, error, status_code)."""
-    err, status = None, None
-    for attempt in range(RETRIES + 1):
-        try:
-            r = await client.get(
-                url,
-                timeout=REQUEST_TIMEOUT,
-                follow_redirects=True,
-                headers=GENERIC_HEADERS,
-            )
-            ct = (r.headers.get("content-type") or "").lower()
-            if "text/html" not in ct and "application/xhtml+xml" not in ct:
-                return None, f"Unsupported content type: {ct}", r.status_code
-            r.raise_for_status()
-            return r.text, None, r.status_code
-        except httpx.HTTPStatusError as e:
-            status = e.response.status_code if e.response is not None else None
-            err = str(e)
-        except httpx.HTTPError as e:
-            err = str(e)
-        # jittered exponential backoff
-        await asyncio.sleep(0.25 * (2 ** attempt))
-    return None, err, status
-
-async def _audit_url_async(client: httpx.AsyncClient, url: str) -> List[Dict[str, str]]:
-    u = normalize_url(url)
-    if not u:
-        return [dict(
-            url=url, check="Fetch failed", severity="HIGH", tag="-",
-            snippet="Empty URL.", recommendation="Enter a valid URL."
-        )]
-    html, err, status = await _afetch(client, u)
-    if err or not html:
-        return [dict(
-            url=u, check="Fetch failed", severity="HIGH", tag="-",
-            snippet=str(err or f"HTTP {status}"),
-            recommendation="Verify URL and connectivity; ensure the page returns HTML."
-        )]
-    return analyze_html(u, html)
-
-async def _audit_batch_async(urls: List[str], update_progress) -> List[Dict[str, str]]:
-    limits = httpx.Limits(max_connections=MAX_CONCURRENCY, max_keepalive_connections=MAX_CONCURRENCY)
-    timeout = httpx.Timeout(REQUEST_TIMEOUT)
-    results: List[Dict[str, str]] = []
-    async with httpx.AsyncClient(http2=True, limits=limits, timeout=timeout) as client:
-        tasks = [_audit_url_async(client, u) for u in urls]
-        done = 0
-        total = len(tasks)
-        for coro in asyncio.as_completed(tasks):
-            issues = await coro
-            results.extend(issues)
-            done += 1
-            update_progress(done, total)
-    return results
-
-def run_batch_concurrent(urls: List[str], prog, status_area) -> List[Dict[str, str]]:
-    def _update_progress(done, total):
-        prog.progress(int(done / total * 100))
-        status_area.write(f"Scanning {done}/{total}")
-    return asyncio.run(_audit_batch_async(urls, _update_progress))
-
-# -----------------------------
 # Session storage
 # -----------------------------
 if "results" not in st.session_state:
@@ -670,7 +679,10 @@ with scan_tab:
             prog = st.progress(0)
             status_area = st.empty()
             n = min(len(urls), int(max_n))
-            results = run_batch_concurrent(urls[:n], prog, status_area)
+
+            # Use concurrent async batch (HTTP/1.1 only)
+            results: List[Dict[str, str]] = run_batch_concurrent(urls[:n], prog, status_area)
+
             st.session_state["results"] = results
             st.session_state["last_run_meta"] = {"urls": urls[:n], "ts": dt.datetime.utcnow().isoformat()}
             cts = summarize(results_to_df(results))
@@ -809,10 +821,8 @@ with smoke_tab:
             err: Optional[str] = None
             passed = False
 
-            # Use the regular (sync) audit for simplicity; it's plenty fast for 6 URLs
             for candidate in candidates:
-                items, err = audit_url(candidate)
-                issues = items
+                issues, err = audit_url(candidate)
                 if expect == "ok":
                     if err is None:
                         used = candidate
@@ -835,12 +845,11 @@ with smoke_tab:
                 "issues_found": len(issues),
                 "error": err or "",
             })
+            all_issues.extend(issues)
             prog.progress(int(i / total * 100))
 
         # Load combined issues into the main Results tab so you can export them
-        st.session_state["results"] = sum(
-            [audit_url(r["resolved_url"])[0] for r in rows], start=[]
-        )
+        st.session_state["results"] = all_issues
         st.session_state["last_run_meta"] = {
             "urls": [r["resolved_url"] for r in rows],
             "ts": dt.datetime.utcnow().isoformat(),
