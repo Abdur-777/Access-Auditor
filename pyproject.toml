@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "access-auditor"
+version = "0.1.0"
+description = "Streamlit app that surfaces high-impact WCAG items on public pages."
+authors = ["Abdullah <abdurag77@gmail.com>"]
+readme = "README.md"
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+# App/runtime deps
+streamlit = "^1.37"
+beautifulsoup4 = "^4.12"
+requests = "^2.32"
+pandas = "^2.2"
+urllib3 = "^2.2"          # used for Retry() import
+playwright = "^1.46"       # installed so build step `python -m playwright install ...` works
+
+# (Optional) if you ever parse XML-heavy pages
+# lxml = "^5.2"
+
+[tool.poetry.group.dev.dependencies]
+# Optional developer tools (not required on Render)
+black = "^24.8"
+ruff = "^0.6"
+pytest = "^8.3"
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
