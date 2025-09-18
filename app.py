@@ -224,11 +224,53 @@ def normalize_url(u: str) -> str:
         u = "https://" + u
     return u
 
-def fetch(url: str, timeout: int = 20) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-    """Fetch URL robustly with retries and a browser-like UA. Returns (html, error, status_code)."""
-    http = _session_with_retries()
+# --------- OPTIONAL headless-browser fetch (only used if USE_PLAYWRIGHT=1) ----------
+def fetch_with_playwright(url: str, timeout: int = 20):
     try:
-        r = http.get(url, timeout=timeout, allow_redirects=True)
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        return None, f"Playwright not installed: {e}", None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            ctx = browser.new_context(
+                user_agent=GENERIC_HEADERS["User-Agent"],
+                locale="en-AU",
+                java_script_enabled=True,
+            )
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            html = page.content()
+            browser.close()
+            return html, None, 200
+    except Exception as e:
+        return None, f"Playwright fetch failed: {e}", None
+# ------------------------------------------------------------------------------------
+
+def fetch(url: str, timeout: int = 20) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """
+    Fetch URL with retries and browser-like headers.
+    Adds Referer + Sec-Fetch* to pass common WAFs.
+    If blocked (403/406/503) and USE_PLAYWRIGHT=1, falls back to headless Chromium.
+    Returns (html, error, status_code).
+    """
+    http = _session_with_retries()
+
+    # Stronger headers to look like a real navigation request
+    hdrs = {
+        **GENERIC_HEADERS,
+        "Referer": "https://www.google.com/",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-User": "?1",
+        "Sec-Fetch-Dest": "document",
+        "DNT": "1",
+        "Pragma": "no-cache",
+        "Cache-Control": "no-cache",
+    }
+
+    try:
+        r = http.get(url, timeout=timeout, allow_redirects=True, headers=hdrs)
         ct = r.headers.get("Content-Type", "") or ""
         if "text/html" not in ct and "application/xhtml+xml" not in ct:
             return None, f"Unsupported content type: {ct}", r.status_code
@@ -236,6 +278,12 @@ def fetch(url: str, timeout: int = 20) -> Tuple[Optional[str], Optional[str], Op
         return r.text, None, r.status_code
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if getattr(e, "response", None) is not None else None
+        # Optional fallback for WAF blocks
+        if status in (403, 406, 503) and os.getenv("USE_PLAYWRIGHT", "0") == "1":
+            html, perr, pstatus = fetch_with_playwright(url, timeout)
+            if html:
+                return html, None, pstatus or 200
+            return None, perr or str(e), status
         return None, str(e), status
     except requests.exceptions.RequestException as e:
         # network/ssl/reset/timeouts
