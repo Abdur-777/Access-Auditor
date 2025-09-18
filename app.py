@@ -225,24 +225,72 @@ def normalize_url(u: str) -> str:
         u = "https://" + u
     return u
 
-# --- Sync fetch (single scan) ---
+# -------- 403-friendly SYNC fetch (requests → referer retry → httpx fallback) --------
 def fetch(url: str, timeout: int = 20) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-    """Fetch URL robustly with retries and a browser-like UA. Returns (html, error, status_code)."""
+    """
+    Fetch URL robustly with retries and a browser-like UA.
+    Strategy:
+      1) requests with GENERIC_HEADERS
+      2) requests again with Referer + no-cache if 401/403 or bad content type
+      3) httpx (HTTP/2 if available) as a final fallback
+    Returns (html, error, status_code)
+    """
     http = _session_with_retries()
+
+    def _is_html(content_type: str) -> bool:
+        ct = (content_type or "").lower()
+        return ("text/html" in ct) or ("application/xhtml+xml" in ct)
+
+    # Attempt 1
     try:
         r = http.get(url, timeout=timeout, allow_redirects=True)
-        ct = r.headers.get("Content-Type", "") or ""
-        if "text/html" not in ct and "application/xhtml+xml" not in ct:
-            return None, f"Unsupported content type: {ct}", r.status_code
-        r.raise_for_status()  # raises HTTPError on 4xx/5xx
-        return r.text, None, r.status_code
-    except requests.exceptions.HTTPError as e:
-        status = e.response.status_code if getattr(e, "response", None) is not None else None
-        return None, str(e), status
+        if r.status_code >= 200 and r.status_code < 300 and _is_html(r.headers.get("Content-Type", "")):
+            return r.text, None, r.status_code
+        # fallthrough on 401/403 or non-HTML
+        if r.status_code not in (401, 403):
+            # non-HTML or other status -> treat as error immediately
+            if not _is_html(r.headers.get("Content-Type", "")):
+                return None, f"Unsupported content type: {r.headers.get('Content-Type','')}", r.status_code
     except requests.exceptions.RequestException as e:
-        # network/ssl/reset/timeouts
-        return None, str(e), None
+        err1 = str(e)
+    else:
+        err1 = None
 
+    # Attempt 2: add Referer and cache-busting hints
+    try:
+        headers2 = dict(GENERIC_HEADERS)
+        headers2["Referer"] = url
+        headers2["Cache-Control"] = "no-cache"
+        headers2["Pragma"] = "no-cache"
+        r2 = requests.get(url, headers=headers2, timeout=timeout, allow_redirects=True)
+        if r2.status_code >= 200 and r2.status_code < 300 and _is_html(r2.headers.get("Content-Type", "")):
+            return r2.text, None, r2.status_code
+        if r2.status_code not in (401, 403):
+            if not _is_html(r2.headers.get("Content-Type", "")):
+                return None, f"Unsupported content type: {r2.headers.get('Content-Type','')}", r2.status_code
+            return None, f"HTTP {r2.status_code}", r2.status_code
+    except requests.exceptions.RequestException as e:
+        err2 = str(e)
+    else:
+        err2 = None
+
+    # Attempt 3: httpx fallback (try HTTP/2 if supported by server)
+    try:
+        with httpx.Client(http2=True, headers={**GENERIC_HEADERS, "Referer": url}, timeout=timeout, follow_redirects=True) as c:
+            r3 = c.get(url)
+            ct3 = r3.headers.get("Content-Type", "")
+            if r3.status_code >= 200 and r3.status_code < 300 and _is_html(ct3):
+                return r3.text, None, r3.status_code
+            if not _is_html(ct3):
+                return None, f"Unsupported content type: {ct3}", r3.status_code
+            return None, f"HTTP {r3.status_code}", r3.status_code
+    except Exception as e:
+        err3 = str(e)
+        # If httpx fails altogether, report the best combined error we have
+        comb = "; ".join([x for x in [err1, err2, err3] if x]) or "403/401 Forbidden or blocked by anti-bot"
+        return None, f"Fetch failed: {comb}", None
+
+# Utils
 def get_text_snippet(tag: Tag, max_len: int = 140) -> str:
     txt = tag.get_text(" ", strip=True) if isinstance(tag, Tag) else ""
     txt = re.sub(r"\s+", " ", txt)
@@ -419,21 +467,44 @@ def audit_url(url: str) -> Tuple[List[Dict[str,str]], Optional[str]]:
     return issues, None
 
 # -----------------------------
-# ASYNC batch scanning (HTTP/1.1 only)
+# ASYNC batch scanning (keep http2=False to avoid missing 'h2' ImportError)
 # -----------------------------
 async def _fetch_async(client: httpx.AsyncClient, url: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """
+    Async fetch with a 403-friendly retry:
+      - first try with base headers
+      - on 401/403 or non-HTML, retry with Referer + cache bust
+    """
+    def _is_html(ct: str) -> bool:
+        ct = (ct or "").lower()
+        return ("text/html" in ct) or ("application/xhtml+xml" in ct)
+
     try:
         r = await client.get(url)
         ct = r.headers.get("Content-Type", "") or ""
-        if "text/html" not in ct and "application/xhtml+xml" not in ct:
+        if 200 <= r.status_code < 300 and _is_html(ct):
+            return r.text, None, r.status_code
+        # Retry only on 401/403 or bad content-type
+        if r.status_code not in (401, 403) and not _is_html(ct):
             return None, f"Unsupported content type: {ct}", r.status_code
-        r.raise_for_status()
-        return r.text, None, r.status_code
-    except httpx.HTTPStatusError as e:
-        status = e.response.status_code if e.response is not None else None
-        return None, str(e), status
     except httpx.RequestError as e:
-        return None, str(e), None
+        first_err = str(e)
+    else:
+        first_err = None
+
+    # retry with referer
+    try:
+        r2 = await client.get(url, headers={"Referer": url, "Cache-Control": "no-cache", "Pragma": "no-cache"})
+        ct2 = r2.headers.get("Content-Type", "") or ""
+        if 200 <= r2.status_code < 300 and _is_html(ct2):
+            return r2.text, None, r2.status_code
+        if not _is_html(ct2):
+            return None, f"Unsupported content type: {ct2}", r2.status_code
+        return None, f"HTTP {r2.status_code}", r2.status_code
+    except httpx.RequestError as e:
+        second_err = str(e)
+        comb = "; ".join([x for x in [first_err, second_err] if x]) or "403/401 Forbidden or blocked by anti-bot"
+        return None, f"Fetch failed: {comb}", None
 
 async def _audit_one_async(client: httpx.AsyncClient, url: str) -> List[Dict[str, str]]:
     url_norm = normalize_url(url)
@@ -621,6 +692,13 @@ if "last_run_meta" not in st.session_state:
 # SCAN TAB
 # -----------------------------
 with scan_tab:
+    # Settings (UA override)
+    with st.expander("Scanner settings", expanded=False):
+        ua = st.text_input("User-Agent", value=GENERIC_HEADERS["User-Agent"])
+        if ua and ua != GENERIC_HEADERS["User-Agent"]:
+            GENERIC_HEADERS["User-Agent"] = ua
+            st.caption("User-Agent updated for this session.")
+
     # Single URL card
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("Run Audit")
@@ -680,7 +758,7 @@ with scan_tab:
             status_area = st.empty()
             n = min(len(urls), int(max_n))
 
-            # Use concurrent async batch (HTTP/1.1 only)
+            # Use concurrent async batch (HTTP/1.1 only; we do referer retry inside)
             results: List[Dict[str, str]] = run_batch_concurrent(urls[:n], prog, status_area)
 
             st.session_state["results"] = results
